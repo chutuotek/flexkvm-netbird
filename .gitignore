@@ -1,0 +1,17 @@
+# Build output
+out/
+
+# Go build (submodule)
+netbird/bin/
+netbird/pkg/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+
+# Misc
+*.log
+*.tmp

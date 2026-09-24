@@ -1,0 +1,1669 @@
+diff --git a/client/firewall/create_linux.go b/client/firewall/create_linux.go
+index d585e85..da94114 100644
+--- a/client/firewall/create_linux.go
++++ b/client/firewall/create_linux.go
+@@ -3,240 +3,15 @@
+ package firewall
+ 
+ import (
+-	"errors"
+-	"fmt"
+-	"os"
+-	"strconv"
+-
+-	"github.com/coreos/go-iptables/iptables"
+-	"github.com/google/nftables"
+-	log "github.com/sirupsen/logrus"
+-
+-	nbiptables "github.com/netbirdio/netbird/client/firewall/iptables"
+ 	firewall "github.com/netbirdio/netbird/client/firewall/manager"
+-	nbnftables "github.com/netbirdio/netbird/client/firewall/nftables"
+-	"github.com/netbirdio/netbird/client/firewall/uspfilter"
+-	"github.com/netbirdio/netbird/client/iface/netstack"
+ 	nftypes "github.com/netbirdio/netbird/client/internal/netflow/types"
+ 	"github.com/netbirdio/netbird/client/internal/statemanager"
+ )
+ 
+-const (
+-	// UNKNOWN is the default value for the firewall type for unknown firewall type
+-	UNKNOWN FWType = iota
+-	// IPTABLES is the value for the iptables firewall type
+-	IPTABLES
+-	// NFTABLES is the value for the nftables firewall type
+-	NFTABLES
+-)
+-
+-// SkipNftablesEnv is the environment variable to skip nftables check
+-const SkipNftablesEnv = "NB_SKIP_NFTABLES_CHECK"
+-
+-// errNoFirewallManager indicates no kernel firewall backend is present,
+-// as opposed to a backend that exists but failed to create or initialize.
+-var errNoFirewallManager = errors.New("no firewall manager found")
+-
+-// FWType is the type for the firewall type
+-type FWType int
+-
+-func NewFirewall(iface IFaceMapper, stateManager *statemanager.Manager, flowLogger nftypes.FlowLogger, disableServerRoutes bool, mtu uint16) (firewall.Manager, error) {
+-	// Userspace firewall without a native counterpart: routing is handled
+-	// entirely in userspace. The interface is opened in the kernel's foreign
+-	// filter chains via a table-less allower, except in netstack mode where no
+-	// kernel interface exists.
+-	if netstack.IsEnabled() || (iface.IsUserspaceBind() && forceUserspaceFirewall()) {
+-		if netstack.IsEnabled() {
+-			log.Info("netstack mode, using userspace firewall")
+-		} else {
+-			log.Info("forcing userspace firewall")
+-		}
+-		cfg := uspfilter.Config{
+-			IFace:               iface,
+-			DisableServerRoutes: disableServerRoutes,
+-			FlowLogger:          flowLogger,
+-			MTU:                 mtu,
+-			InterfaceAllower:    interfaceAllower(iface, mtu),
+-		}
+-
+-		return uspfilter.Create(cfg)
+-	}
+-
+-	// Use native firewall for either kernel or userspace, the interface appears identical to netfilter
+-	fm, err := createNativeFirewall(iface, stateManager, mtu)
+-	switch {
+-	case err == nil && !iface.IsUserspaceBind():
+-		// Nothing to do, fall through
+-	case err == nil && iface.IsUserspaceBind():
+-		// Native firewall handles packet filtering, but the userspace WireGuard bind
+-		// needs a device filter for DNS interception hooks. Install a minimal
+-		// hooks-only filter that passes all traffic through to the kernel firewall.
+-		if err := iface.SetFilter(&uspfilter.HooksFilter{}); err != nil {
+-			log.Warnf("failed to set hooks filter, DNS via memory hooks will not work: %v", err)
+-		}
+-	case err != nil && !iface.IsUserspaceBind():
+-		// Kernel cannot fall back to anything else, need to return error
+-		return nil, err
+-	case err != nil && iface.IsUserspaceBind():
+-		// Fall back to the userspace packet filter if native is unavailable
+-		logNativeFirewallUnavailable(err)
+-		return uspfilter.Create(uspfilter.Config{
+-			IFace:               iface,
+-			DisableServerRoutes: disableServerRoutes,
+-			FlowLogger:          flowLogger,
+-			MTU:                 mtu,
+-			InterfaceAllower:    interfaceAllower(iface, mtu),
+-		})
+-	}
+-
+-	return fm, nil
+-}
+-
+-// interfaceAllower selects how the userspace firewall opens the interface in
+-// foreign kernel chains: nftables when available (which also opens foreign nft
+-// tables), else iptables (the legacy fallback, filter INPUT only), else nil.
+-// firewalld trust is applied separately by the manager. Netstack has no kernel
+-// interface to open.
+-func interfaceAllower(iface IFaceMapper, mtu uint16) uspfilter.InterfaceAllower {
+-	if netstack.IsEnabled() {
+-		return nil
+-	}
+-
+-	nftAllower, err := nbnftables.NewInterfaceAllower(iface, mtu)
+-	if err == nil {
+-		return nftAllower
+-	}
+-	log.Infof("no nftables interface allower: %v", err)
+-
+-	iptAllower, err := nbiptables.NewInterfaceAllower(iface)
+-	if err == nil {
+-		return iptAllower
+-	}
+-	log.Infof("no iptables interface allower: %v", err)
+-
+-	return nil
+-}
+-
+-// logNativeFirewallUnavailable logs the fallback to userspace at info level
+-// when no kernel firewall backend exists, and at warn level otherwise.
+-func logNativeFirewallUnavailable(err error) {
+-	if errors.Is(err, errNoFirewallManager) {
+-		log.Infof("no native firewall backend available: %v. Proceeding with userspace", err)
+-	} else {
+-		log.Warnf("failed to create native firewall: %v. Proceeding with userspace", err)
+-	}
+-}
+-
+-func createNativeFirewall(iface IFaceMapper, stateManager *statemanager.Manager, mtu uint16) (firewall.Manager, error) {
+-	fm, err := createFW(iface, mtu)
+-	if err != nil {
+-		return nil, fmt.Errorf("create firewall: %w", err)
+-	}
+-
+-	if err = fm.Init(stateManager); err != nil {
+-		return nil, fmt.Errorf("init firewall: %s", err)
+-	}
+-
+-	return fm, nil
+-}
+-
+-func createFW(iface IFaceMapper, mtu uint16) (firewall.Manager, error) {
+-	switch check() {
+-	case IPTABLES:
+-		log.Info("creating an iptables firewall manager")
+-		return nbiptables.Create(iface, mtu)
+-	case NFTABLES:
+-		log.Info("creating an nftables firewall manager")
+-		return nbnftables.Create(iface, mtu)
+-	default:
+-		return nil, errNoFirewallManager
+-	}
+-}
+-
+-// check returns the firewall type based on common lib checks. It returns UNKNOWN if no firewall is found.
+-func check() FWType {
+-	useIPTABLES := false
+-	var iptablesChains []string
+-	ip, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+-	if err == nil && isIptablesClientAvailable(ip) {
+-		major, minor, _ := ip.GetIptablesVersion()
+-		// use iptables when its version is lower than 1.8.0 which doesn't work well with our nftables manager
+-		if major < 1 || (major == 1 && minor < 8) {
+-			return IPTABLES
+-		}
+-
+-		useIPTABLES = true
+-
+-		iptablesChains, err = ip.ListChains("filter")
+-		if err != nil {
+-			log.Errorf("failed to list iptables chains: %s", err)
+-			useIPTABLES = false
+-		}
+-	}
+-
+-	// Honor the skip env before probing nftables at all.
+-	if os.Getenv(SkipNftablesEnv) != "true" {
+-		nf := nftables.Conn{}
+-		if chains, err := nf.ListChains(); err == nil {
+-			if !useIPTABLES {
+-				return NFTABLES
+-			}
+-
+-			// search for chains where table is filter
+-			// if we find one, we assume that nftables manager can be used with iptables
+-			for _, chain := range chains {
+-				if chain.Table.Name == "filter" {
+-					return NFTABLES
+-				}
+-			}
+-
+-			// check tables for the following constraints:
+-			// 1. there is no chain in nftables for the filter table and there is at least one chain in iptables, we assume that nftables manager can not be used
+-			// 2. there is no tables or more than one table, we assume that nftables manager can be used
+-			// 3. there is only one table and its name is filter, we assume that nftables manager can not be used, since there was no chain in it
+-			// 4. if we find an error we log and continue with iptables check
+-			nbTablesList, err := nf.ListTables()
+-			switch {
+-			case err == nil && len(iptablesChains) > 0:
+-				return IPTABLES
+-			case err == nil && len(nbTablesList) != 1:
+-				return NFTABLES
+-			case err == nil && len(nbTablesList) == 1 && nbTablesList[0].Name == "filter":
+-				return IPTABLES
+-			case err != nil:
+-				log.Errorf("failed to list nftables tables on fw manager discovery: %s", err)
+-			}
+-		}
+-	}
+-
+-	if useIPTABLES {
+-		return IPTABLES
+-	}
+-
+-	return UNKNOWN
+-}
+-
+-func isIptablesClientAvailable(client *iptables.IPTables) bool {
+-	_, err := client.ListChains("filter")
+-	return err == nil
+-}
+-
+-// forceUserspaceFirewall reports whether the userspace firewall is forced.
+-// NB_FORCE_USERSPACE_ROUTER is an alias: forcing userspace routing implies the
+-// userspace firewall, since the two are no longer separable.
+-func forceUserspaceFirewall() bool {
+-	return envForceBool(EnvForceUserspaceFirewall) || envForceBool(uspfilter.EnvForceUserspaceRouter)
+-}
+-
+-func envForceBool(name string) bool {
+-	val := os.Getenv(name)
+-	if val == "" {
+-		return false
+-	}
+-	force, err := strconv.ParseBool(val)
+-	if err != nil {
+-		log.Warnf("failed to parse %s: %v", name, err)
+-		return false
+-	}
+-	return force
++// IP-KVM trim: neither the native backends (iptables/nftables) nor the
++// userspace packet filter are built in any more, so the client runs without a
++// local ACL engine. Route setup, the interface and connectivity are
++// unaffected; only locally-installed filter/NAT rules are gone.
++func NewFirewall(_ IFaceMapper, _ *statemanager.Manager, _ nftypes.FlowLogger, _ bool, _ uint16) (firewall.Manager, error) {
++	return nopManager{}, nil
+ }
+diff --git a/client/firewall/nop.go b/client/firewall/nop.go
+new file mode 100644
+index 0000000..f1dde34
+--- /dev/null
++++ b/client/firewall/nop.go
+@@ -0,0 +1,46 @@
++//go:build !android
++
++package firewall
++
++import (
++	"net/netip"
++
++	log "github.com/sirupsen/logrus"
++
++	firewall "github.com/netbirdio/netbird/client/firewall/manager"
++	"github.com/netbirdio/netbird/client/internal/statemanager"
++)
++
++// nopManager is a firewall.Manager that installs nothing.
++type nopManager struct{}
++
++var _ firewall.Manager = nopManager{}
++
++func (nopManager) Init(*statemanager.Manager) error { return nil }
++
++func (nopManager) AddFilterRule([]byte, []netip.Prefix, firewall.Network, firewall.Protocol, *firewall.Port, *firewall.Port, firewall.Action) (firewall.Rule, error) {
++	return nil, nil
++}
++
++func (nopManager) DeleteFilterRule(firewall.Rule) error    { return nil }
++func (nopManager) IsServerRouteSupported() bool            { return false }
++func (nopManager) IsStateful() bool                        { return false }
++func (nopManager) AddNatRule(firewall.RouterPair) error    { return nil }
++func (nopManager) RemoveNatRule(firewall.RouterPair) error { return nil }
++func (nopManager) SetLegacyManagement(bool) error          { return nil }
++func (nopManager) Close(*statemanager.Manager) error       { return nil }
++func (nopManager) Flush() error                            { return nil }
++func (nopManager) SetLogLevel(log.Level)                   {}
++func (nopManager) EnableRouting() error                    { return nil }
++func (nopManager) DisableRouting() error                   { return nil }
++
++func (nopManager) AddDNATRule(firewall.ForwardRule) (firewall.Rule, error) { return nil, nil }
++func (nopManager) DeleteDNATRule(firewall.Rule) error                      { return nil }
++func (nopManager) UpdateSet(firewall.Set, []netip.Prefix) error            { return nil }
++func (nopManager) AddInboundDNAT(netip.Addr, firewall.Protocol, uint16, uint16) error    { return nil }
++func (nopManager) RemoveInboundDNAT(netip.Addr, firewall.Protocol, uint16, uint16) error { return nil }
++func (nopManager) AddOutputDNAT(netip.Addr, firewall.Protocol, uint16, uint16) error     { return nil }
++func (nopManager) RemoveOutputDNAT(netip.Addr, firewall.Protocol, uint16, uint16) error  { return nil }
++func (nopManager) SetupEBPFProxyNoTrack(uint16, uint16) error { return nil }
++func (nopManager) RemoveAllLegacyRouteRules() error           { return nil }
++func (nopManager) GetLegacyManagement() bool                  { return false }
+diff --git a/client/iface/wgproxy/factory_kernel.go b/client/iface/wgproxy/factory_kernel.go
+index 7821df3..e774cce 100644
+--- a/client/iface/wgproxy/factory_kernel.go
++++ b/client/iface/wgproxy/factory_kernel.go
+@@ -3,81 +3,24 @@
+ package wgproxy
+ 
+ import (
+-	"os"
+-	"strconv"
+-
+-	log "github.com/sirupsen/logrus"
+-
+-	"github.com/netbirdio/netbird/client/iface/wgproxy/ebpf"
+ 	udpProxy "github.com/netbirdio/netbird/client/iface/wgproxy/udp"
+ )
+ 
+-const (
+-	envDisableEBPFWGProxy = "NB_DISABLE_EBPF_WG_PROXY"
+-)
+-
++// IP-KVM trim: the eBPF WireGuard proxy is not built in, so the factory always
++// produces the userspace UDP proxy (same behaviour as NB_DISABLE_EBPF_WG_PROXY=true).
+ type KernelFactory struct {
+ 	wgPort int
+ 	mtu    uint16
+-
+-	ebpfProxy *ebpf.WGEBPFProxy
+ }
+ 
+ func NewKernelFactory(wgPort int, mtu uint16) *KernelFactory {
+-	f := &KernelFactory{
+-		wgPort: wgPort,
+-		mtu:    mtu,
+-	}
+-
+-	if isEBPFDisabled() {
+-		log.Infof("WireGuard Proxy Factory will produce UDP proxy")
+-		log.Infof("eBPF WireGuard proxy is disabled via %s environment variable", envDisableEBPFWGProxy)
+-		return f
+-	}
+-
+-	ebpfProxy := ebpf.NewWGEBPFProxy(wgPort, mtu)
+-	if err := ebpfProxy.Listen(); err != nil {
+-		log.Infof("WireGuard Proxy Factory will produce UDP proxy")
+-		log.Warnf("failed to initialize ebpf proxy, fallback to user space proxy: %s", err)
+-		return f
+-	}
+-	log.Infof("WireGuard Proxy Factory will produce eBPF proxy")
+-	f.ebpfProxy = ebpfProxy
+-	return f
++	return &KernelFactory{wgPort: wgPort, mtu: mtu}
+ }
+ 
+ func (w *KernelFactory) GetProxy() Proxy {
+-	if w.ebpfProxy == nil {
+-		return udpProxy.NewWGUDPProxy(w.wgPort, w.mtu)
+-	}
+-
+-	return ebpf.NewProxyWrapper(w.ebpfProxy)
+-}
+-
+-// GetProxyPort returns the eBPF proxy port, or 0 if eBPF is not active.
+-func (w *KernelFactory) GetProxyPort() uint16 {
+-	if w.ebpfProxy == nil {
+-		return 0
+-	}
+-	return w.ebpfProxy.GetProxyPort()
++	return udpProxy.NewWGUDPProxy(w.wgPort, w.mtu)
+ }
+ 
+-func (w *KernelFactory) Free() error {
+-	if w.ebpfProxy == nil {
+-		return nil
+-	}
+-	return w.ebpfProxy.Free()
+-}
++func (w *KernelFactory) GetProxyPort() uint16 { return 0 }
+ 
+-func isEBPFDisabled() bool {
+-	val := os.Getenv(envDisableEBPFWGProxy)
+-	if val == "" {
+-		return false
+-	}
+-	disabled, err := strconv.ParseBool(val)
+-	if err != nil {
+-		log.Warnf("failed to parse %s: %v", envDisableEBPFWGProxy, err)
+-		return false
+-	}
+-	return disabled
+-}
++func (w *KernelFactory) Free() error { return nil }
+diff --git a/client/internal/rosenpass/manager.go b/client/internal/rosenpass/manager.go
+index 21dd751..21a8921 100644
+--- a/client/internal/rosenpass/manager.go
++++ b/client/internal/rosenpass/manager.go
+@@ -1,321 +1,39 @@
+ package rosenpass
+ 
+ import (
+-	"bytes"
+-	"crypto/sha256"
+-	"encoding/hex"
+-	"fmt"
+-	"log/slog"
+ 	"net"
+-	"os"
+-	"strconv"
+-	"strings"
+-	"sync"
+ 
+-	rp "cunicu.li/go-rosenpass"
+-	log "github.com/sirupsen/logrus"
+ 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+ )
+ 
+-const (
+-	defaultLog         = slog.LevelInfo
+-	defaultLogLevelVar = "NB_ROSENPASS_LOG_LEVEL"
+-)
+-
+-func hashRosenpassKey(key []byte) string {
+-	hasher := sha256.New()
+-	hasher.Write(key)
+-	return hex.EncodeToString(hasher.Sum(nil))
+-}
+-
+-// rpServer is the subset of rp.Server used by Manager. Defined as an interface
+-// so tests can substitute a mock without spinning up a real UDP server.
+-type rpServer interface {
+-	AddPeer(rp.PeerConfig) (rp.PeerID, error)
+-	RemovePeer(rp.PeerID) error
+-	Run() error
+-	Close() error
++// PresharedKeySetter is the interface for setting preshared keys on WireGuard peers.
++type PresharedKeySetter interface {
++	SetPresharedKey(peerKey string, psk wgtypes.Key, updateOnly bool) error
+ }
+ 
++// IP-KVM trim: Rosenpass (post-quantum pre-shared keys) is not built in. The
++// manager keeps its public shape so the engine's optional wiring still
++// compiles, but every operation is a no-op and RosenpassEnabled stays false.
+ type Manager struct {
+-	ifaceName    string
+-	localWgKey   wgtypes.Key
+-	spk          []byte
+-	ssk          []byte
+-	rpKeyHash    string
+-	preSharedKey *[32]byte
+-	rpPeerIDs    map[string]*rp.PeerID
+-	rpWgHandler  *NetbirdHandler
+-	server       rpServer
+-	lock         sync.Mutex
+-	port         int
+-	wgIface      PresharedKeySetter
+-}
+-
+-// NewManager creates a new Rosenpass manager. localWgKey is the local
+-// WireGuard public key, used to derive the per-peer rendezvous key.
+-func NewManager(preSharedKey *wgtypes.Key, wgIfaceName string, localWgKey wgtypes.Key) (*Manager, error) {
+-	public, secret, err := rp.GenerateKeyPair()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	rpKeyHash := hashRosenpassKey(public)
+-	log.Tracef("generated new rosenpass key pair with public key %s", rpKeyHash)
+-	return &Manager{
+-		ifaceName:    wgIfaceName,
+-		localWgKey:   localWgKey,
+-		rpKeyHash:    rpKeyHash,
+-		spk:          public,
+-		ssk:          secret,
+-		preSharedKey: (*[32]byte)(preSharedKey),
+-		rpPeerIDs:    make(map[string]*rp.PeerID),
+-		// rpWgHandler is created here (instead of only in generateConfig) so it
+-		// is never nil between NewManager and Run(). Otherwise an early
+-		// OnConnected call (race observed on Android, issue #4341) panics on
+-		// nil receiver in addPeer -> m.rpWgHandler.AddPeer. generateConfig will
+-		// replace it with a fresh handler on each Run() to clear stale peer
+-		// state from previous engine sessions.
+-		rpWgHandler: NewNetbirdHandler((*[32]byte)(preSharedKey), localWgKey),
+-		lock:        sync.Mutex{},
+-	}, nil
+-}
+-
+-func (m *Manager) GetPubKey() []byte {
+-	return m.spk
+-}
+-
+-// GetAddress returns the address of the Rosenpass server
+-func (m *Manager) GetAddress() *net.UDPAddr {
+-	return &net.UDPAddr{Port: m.port}
+-}
+-
+-// addPeer adds a new peer to the Rosenpass server
+-func (m *Manager) addPeer(rosenpassPubKey []byte, rosenpassAddr string, wireGuardIP string, wireGuardPubKey string) error {
+-	// Defense in depth against issue #4341 (Android crash): if Run() has not
+-	// completed yet, m.server / m.rpWgHandler may be nil. Return an explicit
+-	// error instead of panicking on nil-receiver dereference.
+-	if m.server == nil {
+-		return fmt.Errorf("rosenpass server not initialized")
+-	}
+-	if m.rpWgHandler == nil {
+-		return fmt.Errorf("rosenpass wg handler not initialized")
+-	}
+-
+-	var err error
+-	pcfg := rp.PeerConfig{PublicKey: rosenpassPubKey}
+-	if m.preSharedKey != nil {
+-		pcfg.PresharedKey = *m.preSharedKey
+-	}
+-	if bytes.Compare(m.spk, rosenpassPubKey) == 1 {
+-		_, strPort, err := net.SplitHostPort(rosenpassAddr)
+-		if err != nil {
+-			return fmt.Errorf("failed to parse rosenpass address: %w", err)
+-		}
+-		peerAddr := net.JoinHostPort(wireGuardIP, strPort)
+-		if pcfg.Endpoint, err = net.ResolveUDPAddr("udp", peerAddr); err != nil {
+-			return fmt.Errorf("failed to resolve peer endpoint address: %w", err)
+-		}
+-		// Our local Rosenpass UDP server binds on the IPv6 wildcard ([::]) — see
+-		// GetAddress(). The remote peer's endpoint (pcfg.Endpoint) is the destination
+-		// our server will sendto when initiating handshakes. ResolveUDPAddr returns a
+-		// 4-byte IPv4 for IPv4 hosts, which the kernel rejects (EDESTADDRREQ) when
+-		// sent from an AF_INET6 socket. Normalize the remote endpoint to IPv4-mapped
+-		// IPv6 so its address family matches our listening socket.
+-		// TODO: maybe bind the Rosenpass UDP server to the peer wg IP addr
+-		if v4 := pcfg.Endpoint.IP.To4(); v4 != nil {
+-			pcfg.Endpoint.IP = v4.To16()
+-		}
+-	}
+-	peerID, err := m.server.AddPeer(pcfg)
+-	if err != nil {
+-		return err
+-	}
+-
+-	key, err := wgtypes.ParseKey(wireGuardPubKey)
+-	if err != nil {
+-		return err
+-	}
+-	m.rpWgHandler.AddPeer(peerID, m.ifaceName, rp.Key(key))
+-	m.rpPeerIDs[wireGuardPubKey] = &peerID
+-	return nil
++	wgIface PresharedKeySetter
+ }
+ 
+-// removePeer removes a peer from the Rosenpass server
+-func (m *Manager) removePeer(wireGuardPubKey string) error {
+-	err := m.server.RemovePeer(*m.rpPeerIDs[wireGuardPubKey])
+-	if err != nil {
+-		return err
+-	}
+-	m.rpWgHandler.RemovePeer(*m.rpPeerIDs[wireGuardPubKey])
+-	return nil
++func NewManager(_ *wgtypes.Key, _ string, _ wgtypes.Key) (*Manager, error) {
++	return nil, nil
+ }
+ 
+-func (m *Manager) generateConfig() (rp.Config, error) {
+-	opts := &slog.HandlerOptions{
+-		Level: getLogLevel(),
+-	}
+-	logger := slog.New(slog.NewTextHandler(os.Stdout, opts))
+-	cfg := rp.Config{Logger: logger}
+-
+-	cfg.PublicKey = m.spk
+-	cfg.SecretKey = m.ssk
+-
+-	cfg.Peers = []rp.PeerConfig{}
+-
+-	m.lock.Lock()
+-	m.rpWgHandler = NewNetbirdHandler(m.preSharedKey, m.localWgKey)
+-	if m.wgIface != nil {
+-		m.rpWgHandler.SetInterface(m.wgIface)
+-	}
+-	m.lock.Unlock()
++func (m *Manager) GetPubKey() []byte { return nil }
+ 
+-	cfg.Handlers = []rp.Handler{m.rpWgHandler}
++func (m *Manager) GetAddress() *net.UDPAddr { return &net.UDPAddr{} }
+ 
+-	port, err := findRandomAvailableUDPPort()
+-	if err != nil {
+-		log.Errorf("could not determine a random port for rosenpass server. Error: %s", err)
+-		return rp.Config{}, err
+-	}
++func (m *Manager) Run() error { return nil }
+ 
+-	m.port = port
++func (m *Manager) Close() error { return nil }
+ 
+-	cfg.ListenAddrs = []*net.UDPAddr{m.GetAddress()}
++func (m *Manager) SetInterface(iface PresharedKeySetter) { m.wgIface = iface }
+ 
+-	return cfg, nil
+-}
+-
+-func getLogLevel() slog.Level {
+-	level, ok := os.LookupEnv(defaultLogLevelVar)
+-	if !ok {
+-		return defaultLog
+-	}
+-	switch strings.ToLower(level) {
+-	case "debug":
+-		return slog.LevelDebug
+-	case "info":
+-		return slog.LevelInfo
+-	case "warn":
+-		return slog.LevelWarn
+-	case "error":
+-		return slog.LevelError
+-	default:
+-		log.Warnf("unknown log level: %s. Using default %s", level, defaultLog.String())
+-		return defaultLog
+-	}
+-}
++func (m *Manager) OnConnected(string, []byte, string, string) {}
+ 
+-func (m *Manager) OnDisconnected(peerKey string) {
+-	m.lock.Lock()
+-	defer m.lock.Unlock()
++func (m *Manager) OnDisconnected(string) {}
+ 
+-	if _, ok := m.rpPeerIDs[peerKey]; !ok {
+-		// if we didn't have this peer yet, just skip
+-		return
+-	}
+-
+-	err := m.removePeer(peerKey)
+-	if err != nil {
+-		log.Error("failed to remove rosenpass peer", err)
+-	}
+-
+-	delete(m.rpPeerIDs, peerKey)
+-}
+-
+-// Run starts the Rosenpass server
+-func (m *Manager) Run() error {
+-	conf, err := m.generateConfig()
+-	if err != nil {
+-		return err
+-	}
+-
+-	server, err := rp.NewUDPServer(conf)
+-	if err != nil {
+-		return err
+-	}
+-
+-	m.lock.Lock()
+-	m.server = server
+-	m.lock.Unlock()
+-
+-	log.Infof("starting rosenpass server on port %d", m.port)
+-
+-	return server.Run()
+-}
+-
+-// Close closes the Rosenpass server
+-func (m *Manager) Close() error {
+-	m.lock.Lock()
+-	server := m.server
+-	m.server = nil
+-	m.lock.Unlock()
+-	if server == nil {
+-		return nil
+-	}
+-	if err := server.Close(); err != nil {
+-		log.Errorf("failed closing local rosenpass server: %v", err)
+-	}
+-	return nil
+-}
+-
+-// SetInterface sets the WireGuard interface for the rosenpass handler.
+-// This can be called before or after Run() - the interface will be stored
+-// and passed to the handler when it's created or updated immediately if
+-// already running.
+-func (m *Manager) SetInterface(iface PresharedKeySetter) {
+-	m.lock.Lock()
+-	defer m.lock.Unlock()
+-
+-	m.wgIface = iface
+-	if m.rpWgHandler != nil {
+-		m.rpWgHandler.SetInterface(iface)
+-	}
+-}
+-
+-// OnConnected is a handler function that is triggered when a connection to a remote peer establishes
+-func (m *Manager) OnConnected(remoteWireGuardKey string, remoteRosenpassPubKey []byte, wireGuardIP string, remoteRosenpassAddr string) {
+-	m.lock.Lock()
+-	defer m.lock.Unlock()
+-
+-	if remoteRosenpassPubKey == nil {
+-		log.Warnf("remote peer with public key %s does not support rosenpass", remoteWireGuardKey)
+-		return
+-	}
+-
+-	rpKeyHash := hashRosenpassKey(remoteRosenpassPubKey)
+-	log.Debugf("received remote rosenpass key %s, my key %s", rpKeyHash, m.rpKeyHash)
+-
+-	err := m.addPeer(remoteRosenpassPubKey, remoteRosenpassAddr, wireGuardIP, remoteWireGuardKey)
+-	if err != nil {
+-		log.Errorf("failed to add rosenpass peer: %s", err)
+-		return
+-	}
+-}
+-
+-// IsPresharedKeyInitialized returns true if Rosenpass has completed a handshake
+-// and set a PSK for the given WireGuard peer.
+-func (m *Manager) IsPresharedKeyInitialized(wireGuardPubKey string) bool {
+-	m.lock.Lock()
+-	defer m.lock.Unlock()
+-
+-	peerID, ok := m.rpPeerIDs[wireGuardPubKey]
+-	if !ok || peerID == nil {
+-		return false
+-	}
+-
+-	return m.rpWgHandler.IsPeerInitialized(*peerID)
+-}
+-
+-func findRandomAvailableUDPPort() (int, error) {
+-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+-	if err != nil {
+-		return 0, fmt.Errorf("could not find an available UDP port: %w", err)
+-	}
+-	defer conn.Close()
+-
+-	_, portStr, err := net.SplitHostPort(conn.LocalAddr().String())
+-	if err != nil {
+-		return 0, fmt.Errorf("parse local address %s: %w", conn.LocalAddr(), err)
+-	}
+-	return strconv.Atoi(portStr)
+-}
++func (m *Manager) IsPresharedKeyInitialized(string) bool { return false }
+diff --git a/client/internal/rosenpass/manager_test.go b/client/internal/rosenpass/manager_test.go
+deleted file mode 100644
+index 69e18ac..0000000
+--- a/client/internal/rosenpass/manager_test.go
++++ /dev/null
+@@ -1,412 +0,0 @@
+-package rosenpass
+-
+-import (
+-	"errors"
+-	"os"
+-	"sync"
+-	"testing"
+-
+-	rp "cunicu.li/go-rosenpass"
+-	"github.com/stretchr/testify/require"
+-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+-)
+-
+-// --- test doubles -----------------------------------------------------------
+-
+-type addPeerCall struct {
+-	cfg rp.PeerConfig
+-}
+-
+-type removePeerCall struct {
+-	id rp.PeerID
+-}
+-
+-type mockServer struct {
+-	mu        sync.Mutex
+-	addCalls  []addPeerCall
+-	removed   []removePeerCall
+-	nextID    rp.PeerID
+-	addErr    error
+-	removeErr error
+-	closed    bool
+-	ran       bool
+-}
+-
+-func (m *mockServer) AddPeer(cfg rp.PeerConfig) (rp.PeerID, error) {
+-	m.mu.Lock()
+-	defer m.mu.Unlock()
+-	m.addCalls = append(m.addCalls, addPeerCall{cfg: cfg})
+-	if m.addErr != nil {
+-		return rp.PeerID{}, m.addErr
+-	}
+-	// Increment a byte in nextID so distinct peers get distinct IDs.
+-	m.nextID[0]++
+-	return m.nextID, nil
+-}
+-
+-func (m *mockServer) RemovePeer(id rp.PeerID) error {
+-	m.mu.Lock()
+-	defer m.mu.Unlock()
+-	m.removed = append(m.removed, removePeerCall{id: id})
+-	return m.removeErr
+-}
+-
+-func (m *mockServer) Run() error   { m.ran = true; return nil }
+-func (m *mockServer) Close() error { m.closed = true; return nil }
+-
+-type setPSKCall struct {
+-	peerKey    string
+-	psk        wgtypes.Key
+-	updateOnly bool
+-}
+-
+-type mockIface struct {
+-	mu    sync.Mutex
+-	calls []setPSKCall
+-	err   error
+-}
+-
+-func (m *mockIface) SetPresharedKey(peerKey string, psk wgtypes.Key, updateOnly bool) error {
+-	m.mu.Lock()
+-	defer m.mu.Unlock()
+-	m.calls = append(m.calls, setPSKCall{peerKey: peerKey, psk: psk, updateOnly: updateOnly})
+-	return m.err
+-}
+-
+-// newTestManager builds a Manager with deterministic spk so tie-break
+-// against a peer pubkey is controllable from tests. The provided spk byte
+-// becomes the first byte; remaining bytes are zero.
+-func newTestManager(spkFirstByte byte, mock *mockServer) *Manager {
+-	spk := make([]byte, 32)
+-	spk[0] = spkFirstByte
+-	return &Manager{
+-		ifaceName:   "wt0",
+-		spk:         spk,
+-		ssk:         make([]byte, 32),
+-		rpKeyHash:   "test-hash",
+-		rpPeerIDs:   make(map[string]*rp.PeerID),
+-		rpWgHandler: NewNetbirdHandler(nil, wgtypes.Key{0x01}),
+-		server:      mock,
+-	}
+-}
+-
+-// validWGKey returns a deterministic 32-byte wireguard public key (base64).
+-func validWGKey(t *testing.T, lastByte byte) string {
+-	t.Helper()
+-	var k wgtypes.Key
+-	k[31] = lastByte
+-	return k.String()
+-}
+-
+-// --- pure helpers ----------------------------------------------------------
+-
+-func TestHashRosenpassKey_Deterministic(t *testing.T) {
+-	key := []byte("hello-rosenpass")
+-	require.Equal(t, hashRosenpassKey(key), hashRosenpassKey(key))
+-	require.Len(t, hashRosenpassKey(key), 64) // sha256 hex
+-}
+-
+-func TestHashRosenpassKey_DifferentInputsDifferOutputs(t *testing.T) {
+-	require.NotEqual(t, hashRosenpassKey([]byte("a")), hashRosenpassKey([]byte("b")))
+-}
+-
+-func TestGetLogLevel_DefaultWhenUnset(t *testing.T) {
+-	// Snapshot + unset to exercise the LookupEnv ok=false branch. t.Setenv
+-	// can only set, not delete, so do it manually with restore via t.Cleanup.
+-	prev, hadPrev := os.LookupEnv(defaultLogLevelVar)
+-	require.NoError(t, os.Unsetenv(defaultLogLevelVar))
+-	t.Cleanup(func() {
+-		if hadPrev {
+-			_ = os.Setenv(defaultLogLevelVar, prev)
+-		} else {
+-			_ = os.Unsetenv(defaultLogLevelVar)
+-		}
+-	})
+-	require.Equal(t, defaultLog.String(), getLogLevel().String())
+-}
+-
+-func TestGetLogLevel_Cases(t *testing.T) {
+-	cases := map[string]string{
+-		"debug":   "DEBUG",
+-		"info":    "INFO",
+-		"warn":    "WARN",
+-		"error":   "ERROR",
+-		"unknown": "INFO", // default fallback
+-	}
+-	for input, wantStr := range cases {
+-		input, wantStr := input, wantStr
+-		t.Run(input, func(t *testing.T) {
+-			t.Setenv(defaultLogLevelVar, input)
+-			require.Equal(t, wantStr, getLogLevel().String())
+-		})
+-	}
+-}
+-
+-func TestFindRandomAvailableUDPPort(t *testing.T) {
+-	port, err := findRandomAvailableUDPPort()
+-	require.NoError(t, err)
+-	require.Greater(t, port, 0)
+-	require.LessOrEqual(t, port, 65535)
+-}
+-
+-// --- addPeer ---------------------------------------------------------------
+-
+-func TestAddPeer_HigherLocalPubkey_SetsEndpoint(t *testing.T) {
+-	srv := &mockServer{}
+-	m := newTestManager(0xFF, srv) // local spk lexicographically larger
+-
+-	remotePubKey := make([]byte, 32) // remote spk = all zeros (smaller)
+-	err := m.addPeer(remotePubKey, "rosenpass-host:7000", "100.1.1.1", validWGKey(t, 1))
+-	require.NoError(t, err)
+-	require.Len(t, srv.addCalls, 1)
+-
+-	ep := srv.addCalls[0].cfg.Endpoint
+-	require.NotNil(t, ep, "initiator side must set Endpoint")
+-	require.Equal(t, 7000, ep.Port)
+-	require.Equal(t, "100.1.1.1", ep.IP.String())
+-}
+-
+-func TestAddPeer_HigherLocalPubkey_EndpointIPIsIPv4Mapped(t *testing.T) {
+-	// Regression guard for the EDESTADDRREQ fix: Endpoint.IP must be 16-byte
+-	// (IPv4-mapped IPv6) so it matches the AF_INET6 listening socket family.
+-	srv := &mockServer{}
+-	m := newTestManager(0xFF, srv)
+-
+-	err := m.addPeer(make([]byte, 32), "rp:5000", "100.1.1.1", validWGKey(t, 1))
+-	require.NoError(t, err)
+-
+-	ep := srv.addCalls[0].cfg.Endpoint
+-	require.NotNil(t, ep)
+-	require.Len(t, ep.IP, 16, "IPv4 endpoint must be normalized to 16-byte v4-mapped form")
+-	require.True(t, ep.IP.To4() != nil, "Endpoint must still be detected as IPv4")
+-}
+-
+-func TestAddPeer_LowerLocalPubkey_LeavesEndpointNil(t *testing.T) {
+-	srv := &mockServer{}
+-	m := newTestManager(0x00, srv) // local spk smaller
+-
+-	remotePubKey := make([]byte, 32)
+-	remotePubKey[0] = 0xFF
+-	err := m.addPeer(remotePubKey, "rp:5000", "100.1.1.1", validWGKey(t, 2))
+-	require.NoError(t, err)
+-
+-	require.Nil(t, srv.addCalls[0].cfg.Endpoint, "responder side must NOT set Endpoint")
+-}
+-
+-func TestAddPeer_PresharedKeyPropagated(t *testing.T) {
+-	srv := &mockServer{}
+-	psk := &wgtypes.Key{0x42}
+-	m := newTestManager(0xFF, srv)
+-	m.preSharedKey = (*[32]byte)(psk)
+-
+-	err := m.addPeer(make([]byte, 32), "rp:5000", "100.1.1.1", validWGKey(t, 3))
+-	require.NoError(t, err)
+-	require.Equal(t, [32]byte(*psk), [32]byte(srv.addCalls[0].cfg.PresharedKey))
+-}
+-
+-func TestAddPeer_InvalidRosenpassAddr_ReturnsError(t *testing.T) {
+-	srv := &mockServer{}
+-	m := newTestManager(0xFF, srv) // initiator path → parses rosenpassAddr
+-
+-	err := m.addPeer(make([]byte, 32), "not-a-host-port", "100.1.1.1", validWGKey(t, 1))
+-	require.Error(t, err)
+-	require.Empty(t, srv.addCalls, "server.AddPeer must not run when address parse fails")
+-}
+-
+-func TestAddPeer_InvalidWireGuardPubKey_ReturnsError(t *testing.T) {
+-	srv := &mockServer{}
+-	m := newTestManager(0xFF, srv)
+-
+-	err := m.addPeer(make([]byte, 32), "rp:5000", "100.1.1.1", "not-a-valid-key")
+-	require.Error(t, err)
+-}
+-
+-func TestAddPeer_ServerError_Propagates(t *testing.T) {
+-	srv := &mockServer{addErr: errors.New("boom")}
+-	m := newTestManager(0xFF, srv)
+-
+-	err := m.addPeer(make([]byte, 32), "rp:5000", "100.1.1.1", validWGKey(t, 1))
+-	require.Error(t, err)
+-}
+-
+-// Regression guard for issue #4341 (Android crash). If Run() has not completed
+-// before OnConnected fires, m.rpWgHandler or m.server may be nil. Without the
+-// nil guards, m.rpWgHandler.AddPeer panics on nil receiver.
+-func TestAddPeer_NilHandler_ReturnsErrorNoCrash(t *testing.T) {
+-	srv := &mockServer{}
+-	m := newTestManager(0xFF, srv)
+-	m.rpWgHandler = nil // simulate Run() not yet completed
+-
+-	err := m.addPeer(make([]byte, 32), "rp:5000", "100.1.1.1", validWGKey(t, 1))
+-	require.Error(t, err)
+-	require.Contains(t, err.Error(), "wg handler not initialized")
+-}
+-
+-func TestAddPeer_NilServer_ReturnsErrorNoCrash(t *testing.T) {
+-	m := newTestManager(0xFF, nil)
+-	m.server = nil // simulate Run() not yet completed
+-
+-	err := m.addPeer(make([]byte, 32), "rp:5000", "100.1.1.1", validWGKey(t, 1))
+-	require.Error(t, err)
+-	require.Contains(t, err.Error(), "server not initialized")
+-}
+-
+-// NewManager must pre-initialize rpWgHandler so the nil-receiver crash from
+-// issue #4341 cannot occur in the window between NewManager and Run().
+-func TestNewManager_PreInitializesHandler(t *testing.T) {
+-	psk := wgtypes.Key{}
+-	m, err := NewManager(&psk, "wt0", wgtypes.Key{0x01})
+-	require.NoError(t, err)
+-	require.NotNil(t, m.rpWgHandler, "rpWgHandler must be initialized in NewManager")
+-}
+-
+-func TestAddPeer_RecordsPeerID(t *testing.T) {
+-	srv := &mockServer{}
+-	m := newTestManager(0xFF, srv)
+-
+-	wgKey := validWGKey(t, 5)
+-	err := m.addPeer(make([]byte, 32), "rp:5000", "100.1.1.1", wgKey)
+-	require.NoError(t, err)
+-	require.Contains(t, m.rpPeerIDs, wgKey)
+-}
+-
+-// --- OnConnected / OnDisconnected ------------------------------------------
+-
+-func TestOnConnected_NilRemotePubKey_NoAddPeer(t *testing.T) {
+-	srv := &mockServer{}
+-	m := newTestManager(0xFF, srv)
+-
+-	m.OnConnected(validWGKey(t, 1), nil, "100.1.1.1", "rp:5000")
+-	require.Empty(t, srv.addCalls, "nil remote rosenpass pubkey must skip AddPeer")
+-	require.Empty(t, m.rpPeerIDs)
+-}
+-
+-func TestOnConnected_ValidPubKey_CallsAddPeer(t *testing.T) {
+-	srv := &mockServer{}
+-	m := newTestManager(0xFF, srv)
+-
+-	wgKey := validWGKey(t, 1)
+-	m.OnConnected(wgKey, make([]byte, 32), "100.1.1.1", "rp:5000")
+-	require.Len(t, srv.addCalls, 1)
+-	require.Contains(t, m.rpPeerIDs, wgKey)
+-}
+-
+-func TestOnDisconnected_UnknownPeer_NoOp(t *testing.T) {
+-	srv := &mockServer{}
+-	m := newTestManager(0xFF, srv)
+-
+-	m.OnDisconnected(validWGKey(t, 99))
+-	require.Empty(t, srv.removed, "unknown peer key must not call RemovePeer")
+-}
+-
+-func TestOnDisconnected_KnownPeer_CallsRemoveAndForgets(t *testing.T) {
+-	srv := &mockServer{}
+-	m := newTestManager(0xFF, srv)
+-
+-	wgKey := validWGKey(t, 1)
+-	require.NoError(t, m.addPeer(make([]byte, 32), "rp:5000", "100.1.1.1", wgKey))
+-	require.Contains(t, m.rpPeerIDs, wgKey)
+-
+-	m.OnDisconnected(wgKey)
+-	require.Len(t, srv.removed, 1)
+-	require.NotContains(t, m.rpPeerIDs, wgKey, "peer must be forgotten after disconnect")
+-}
+-
+-// --- IsPresharedKeyInitialized ---------------------------------------------
+-
+-func TestIsPresharedKeyInitialized_UnknownPeer_ReturnsFalse(t *testing.T) {
+-	srv := &mockServer{}
+-	m := newTestManager(0xFF, srv)
+-	require.False(t, m.IsPresharedKeyInitialized(validWGKey(t, 1)))
+-}
+-
+-func TestIsPresharedKeyInitialized_AddedButNotHandshaken_ReturnsFalse(t *testing.T) {
+-	srv := &mockServer{}
+-	m := newTestManager(0xFF, srv)
+-
+-	wgKey := validWGKey(t, 2)
+-	require.NoError(t, m.addPeer(make([]byte, 32), "rp:5000", "100.1.1.1", wgKey))
+-	require.False(t, m.IsPresharedKeyInitialized(wgKey))
+-}
+-
+-// --- NetbirdHandler.applyKey ----------------------------------------------
+-
+-func TestHandler_ApplyKey_FirstCallUsesUpdateOnlyFalse(t *testing.T) {
+-	h := NewNetbirdHandler(nil, wgtypes.Key{0x01})
+-	iface := &mockIface{}
+-	h.SetInterface(iface)
+-
+-	pid := rp.PeerID{0x01}
+-	wgKey := wgtypes.Key{0xAA}
+-	h.AddPeer(pid, "wt0", rp.Key(wgKey))
+-
+-	psk := rp.Key{0xBB}
+-	h.HandshakeCompleted(pid, psk)
+-
+-	require.Len(t, iface.calls, 1)
+-	require.False(t, iface.calls[0].updateOnly, "first PSK rotation must use updateOnly=false")
+-	require.Equal(t, wgKey.String(), iface.calls[0].peerKey)
+-}
+-
+-func TestHandler_ApplyKey_SubsequentCallsUseUpdateOnlyTrue(t *testing.T) {
+-	h := NewNetbirdHandler(nil, wgtypes.Key{0x01})
+-	iface := &mockIface{}
+-	h.SetInterface(iface)
+-
+-	pid := rp.PeerID{0x02}
+-	h.AddPeer(pid, "wt0", rp.Key(wgtypes.Key{0xCC}))
+-
+-	h.HandshakeCompleted(pid, rp.Key{0x01}) // first
+-	h.HandshakeCompleted(pid, rp.Key{0x02}) // second
+-
+-	require.Len(t, iface.calls, 2)
+-	require.False(t, iface.calls[0].updateOnly)
+-	require.True(t, iface.calls[1].updateOnly, "subsequent rotations must use updateOnly=true")
+-}
+-
+-func TestHandler_ApplyKey_NilInterface_NoCrashNoCall(t *testing.T) {
+-	h := NewNetbirdHandler(nil, wgtypes.Key{0x01})
+-	// no SetInterface — iface remains nil
+-	pid := rp.PeerID{0x03}
+-	h.AddPeer(pid, "wt0", rp.Key(wgtypes.Key{}))
+-
+-	// Must not panic.
+-	h.HandshakeCompleted(pid, rp.Key{})
+-}
+-
+-func TestHandler_ApplyKey_UnknownPeer_NoCall(t *testing.T) {
+-	h := NewNetbirdHandler(nil, wgtypes.Key{0x01})
+-	iface := &mockIface{}
+-	h.SetInterface(iface)
+-
+-	h.HandshakeCompleted(rp.PeerID{0xFF}, rp.Key{})
+-	require.Empty(t, iface.calls, "unknown peer id must not trigger SetPresharedKey")
+-}
+-
+-func TestHandler_RemovePeer_ClearsInitializedState(t *testing.T) {
+-	h := NewNetbirdHandler(nil, wgtypes.Key{0x01})
+-	iface := &mockIface{}
+-	h.SetInterface(iface)
+-
+-	pid := rp.PeerID{0x04}
+-	h.AddPeer(pid, "wt0", rp.Key(wgtypes.Key{0xDD}))
+-	h.HandshakeCompleted(pid, rp.Key{0x01})
+-	require.True(t, h.IsPeerInitialized(pid))
+-
+-	h.RemovePeer(pid)
+-	require.False(t, h.IsPeerInitialized(pid), "RemovePeer must clear initialized flag")
+-}
+-
+-func TestHandler_SetInterfaceAfterAddPeer_StillReceivesKey(t *testing.T) {
+-	h := NewNetbirdHandler(nil, wgtypes.Key{0x01})
+-	pid := rp.PeerID{0x05}
+-	wgKey := wgtypes.Key{0xEE}
+-	h.AddPeer(pid, "wt0", rp.Key(wgKey))
+-
+-	iface := &mockIface{}
+-	h.SetInterface(iface) // set after AddPeer
+-
+-	h.HandshakeCompleted(pid, rp.Key{0x42})
+-	require.Len(t, iface.calls, 1)
+-	require.Equal(t, wgKey.String(), iface.calls[0].peerKey)
+-}
+diff --git a/client/internal/rosenpass/netbird_handler.go b/client/internal/rosenpass/netbird_handler.go
+deleted file mode 100644
+index 672650c..0000000
+--- a/client/internal/rosenpass/netbird_handler.go
++++ /dev/null
+@@ -1,202 +0,0 @@
+-package rosenpass
+-
+-import (
+-	"sync"
+-
+-	rp "cunicu.li/go-rosenpass"
+-	log "github.com/sirupsen/logrus"
+-
+-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+-)
+-
+-// PresharedKeySetter is the interface for setting preshared keys on WireGuard peers.
+-// This minimal interface allows rosenpass to update PSKs without depending on the full WGIface.
+-type PresharedKeySetter interface {
+-	SetPresharedKey(peerKey string, psk wgtypes.Key, updateOnly bool) error
+-}
+-
+-type wireGuardPeer struct {
+-	Interface string
+-	PublicKey rp.Key
+-	// initialized is true once a completed exchange has set a
+-	// Rosenpass-managed PSK for this peer.
+-	initialized bool
+-	// chainKey is the key output by the last completed exchange, advanced by
+-	// one ratchet step on expiry. Nil until the first exchange completes and
+-	// after the peer has fallen back to the rendezvous key.
+-	chainKey *wgtypes.Key
+-	// expiries counts failed renewals since the last completed exchange.
+-	expiries int
+-}
+-
+-type NetbirdHandler struct {
+-	mu    sync.Mutex
+-	iface PresharedKeySetter
+-	// preSharedKey is the account-level preshared key, used as the rendezvous
+-	// key when set. Nil means the deterministic seed key is used instead.
+-	preSharedKey *[32]byte
+-	// localWgKey is the local WireGuard public key, one of the two inputs to
+-	// the deterministic seed key.
+-	localWgKey wgtypes.Key
+-	peers      map[rp.PeerID]*wireGuardPeer
+-}
+-
+-func NewNetbirdHandler(preSharedKey *[32]byte, localWgKey wgtypes.Key) *NetbirdHandler {
+-	return &NetbirdHandler{
+-		preSharedKey: preSharedKey,
+-		localWgKey:   localWgKey,
+-		peers:        map[rp.PeerID]*wireGuardPeer{},
+-	}
+-}
+-
+-// SetInterface sets the WireGuard interface for the handler.
+-// This must be called after the WireGuard interface is created.
+-func (h *NetbirdHandler) SetInterface(iface PresharedKeySetter) {
+-	h.mu.Lock()
+-	defer h.mu.Unlock()
+-	h.iface = iface
+-}
+-
+-// AddPeer registers a peer with the handler. Re-adding a known peer (every
+-// reconnection does) keeps its key recovery state.
+-func (h *NetbirdHandler) AddPeer(pid rp.PeerID, intf string, pk rp.Key) {
+-	h.mu.Lock()
+-	defer h.mu.Unlock()
+-	if existing, ok := h.peers[pid]; ok && existing.PublicKey == pk {
+-		existing.Interface = intf
+-		return
+-	}
+-	h.peers[pid] = &wireGuardPeer{
+-		Interface: intf,
+-		PublicKey: pk,
+-	}
+-}
+-
+-func (h *NetbirdHandler) RemovePeer(pid rp.PeerID) {
+-	h.mu.Lock()
+-	defer h.mu.Unlock()
+-	delete(h.peers, pid)
+-}
+-
+-// IsPeerInitialized returns true if Rosenpass has completed a handshake
+-// and set a PSK for this peer.
+-func (h *NetbirdHandler) IsPeerInitialized(pid rp.PeerID) bool {
+-	h.mu.Lock()
+-	defer h.mu.Unlock()
+-	peer, ok := h.peers[pid]
+-	return ok && peer.initialized
+-}
+-
+-// HandshakeCompleted programs the freshly exchanged output key and resets the
+-// peer's key recovery state.
+-func (h *NetbirdHandler) HandshakeCompleted(pid rp.PeerID, key rp.Key) {
+-	psk := wgtypes.Key(key)
+-
+-	h.mu.Lock()
+-	defer h.mu.Unlock()
+-
+-	peer, ok := h.peers[pid]
+-	if !ok {
+-		return
+-	}
+-	if peer.expiries > 0 {
+-		log.Infof("rosenpass exchange completed for peer %s after %d expired renewals", wgtypes.Key(peer.PublicKey), peer.expiries)
+-	}
+-	// chainKey tracks the shared exchange output regardless of the local write
+-	// outcome, so both ends still converge on the next expiry.
+-	peer.chainKey = &psk
+-	peer.expiries = 0
+-	if !h.applyKeyLocked(pid, psk, peer.initialized) {
+-		return
+-	}
+-	peer.initialized = true
+-}
+-
+-// HandshakeExpired replaces the expired key. The renewal exchange runs over
+-// the tunnel keyed by the PSK itself, so the replacement must be derivable on
+-// both ends without communication: the first expiry ratchets the last shared
+-// key forward, repeated expiries (and expiries without a completed exchange)
+-// fall back to the rendezvous key and drop the peer out of the initialized
+-// state so connection reconfigurations reprogram the rendezvous key as well.
+-func (h *NetbirdHandler) HandshakeExpired(pid rp.PeerID) {
+-	h.mu.Lock()
+-	defer h.mu.Unlock()
+-
+-	peer, ok := h.peers[pid]
+-	if !ok {
+-		return
+-	}
+-
+-	peer.expiries++
+-
+-	var psk wgtypes.Key
+-	if peer.chainKey != nil && peer.expiries == 1 {
+-		log.Infof("rosenpass key for peer %s expired without renewal, advancing to ratcheted key", wgtypes.Key(peer.PublicKey))
+-		psk = RatchetKey(*peer.chainKey)
+-		peer.chainKey = &psk
+-	} else {
+-		rendezvous, err := h.rendezvousKey(peer)
+-		if err != nil {
+-			// Fail closed: without a rendezvous key the expired key must
+-			// still be rotated out, even if the replacement is unusable.
+-			log.Errorf("failed to derive rendezvous key, replacing expired key with a random one: %v", err)
+-			h.applyRandomKeyLocked(pid)
+-			return
+-		}
+-		log.Warnf("rosenpass key for peer %s expired %d times without renewal, falling back to the rendezvous key", wgtypes.Key(peer.PublicKey), peer.expiries)
+-		psk = rendezvous
+-		peer.chainKey = nil
+-		peer.initialized = false
+-	}
+-
+-	h.applyKeyLocked(pid, psk, true)
+-}
+-
+-// rendezvousKey returns the key both ends converge on without communication:
+-// the account-level preshared key when configured, the deterministic seed key
+-// otherwise. It mirrors the key that peer connections program when Rosenpass
+-// does not manage the peer yet.
+-func (h *NetbirdHandler) rendezvousKey(peer *wireGuardPeer) (wgtypes.Key, error) {
+-	if h.preSharedKey != nil {
+-		return *h.preSharedKey, nil
+-	}
+-
+-	seed, err := DeterministicSeedKey(h.localWgKey.String(), wgtypes.Key(peer.PublicKey).String())
+-	if err != nil {
+-		return wgtypes.Key{}, err
+-	}
+-	return *seed, nil
+-}
+-
+-// applyKeyLocked writes the preshared key for the peer to the WireGuard
+-// interface and reports whether the write succeeded. Callers must hold h.mu
+-// for the whole state-mutation-plus-write so that a concurrent completion and
+-// expiry cannot reorder their writes relative to the in-memory chain key.
+-func (h *NetbirdHandler) applyKeyLocked(pid rp.PeerID, psk wgtypes.Key, updateOnly bool) bool {
+-	peer, ok := h.peers[pid]
+-	if !ok {
+-		return false
+-	}
+-
+-	if h.iface == nil {
+-		log.Warn("rosenpass: interface not set, cannot update preshared key")
+-		return false
+-	}
+-
+-	peerKey := wgtypes.Key(peer.PublicKey).String()
+-	if err := h.iface.SetPresharedKey(peerKey, psk, updateOnly); err != nil {
+-		log.Errorf("Failed to apply rosenpass key: %v", err)
+-		return false
+-	}
+-
+-	return true
+-}
+-
+-func (h *NetbirdHandler) applyRandomKeyLocked(pid rp.PeerID) {
+-	key, err := rp.GeneratePresharedKey()
+-	if err != nil {
+-		log.Errorf("failed to generate random preshared key: %v", err)
+-		return
+-	}
+-	h.applyKeyLocked(pid, wgtypes.Key(key), true)
+-}
+diff --git a/client/internal/rosenpass/netbird_handler_test.go b/client/internal/rosenpass/netbird_handler_test.go
+deleted file mode 100644
+index 9d91ba9..0000000
+--- a/client/internal/rosenpass/netbird_handler_test.go
++++ /dev/null
+@@ -1,250 +0,0 @@
+-package rosenpass
+-
+-import (
+-	"testing"
+-
+-	rp "cunicu.li/go-rosenpass"
+-	"github.com/stretchr/testify/require"
+-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+-)
+-
+-// handlerTestLink wires two NetbirdHandlers as the two ends of a single
+-// tunnel: handler A manages the rosenpass peer B and vice versa, the way two
+-// NetBird clients see each other.
+-type handlerTestLink struct {
+-	handlerA, handlerB *NetbirdHandler
+-	ifaceA, ifaceB     *mockIface
+-	pidA, pidB         rp.PeerID
+-	wgKeyA, wgKeyB     wgtypes.Key
+-}
+-
+-func newHandlerTestLink(t *testing.T, preSharedKey *[32]byte) *handlerTestLink {
+-	t.Helper()
+-
+-	link := &handlerTestLink{
+-		ifaceA: &mockIface{},
+-		ifaceB: &mockIface{},
+-	}
+-	link.pidA[0] = 0xaa
+-	link.pidB[0] = 0xbb
+-	link.wgKeyA[31] = 1
+-	link.wgKeyB[31] = 2
+-
+-	link.handlerA = NewNetbirdHandler(preSharedKey, link.wgKeyA)
+-	link.handlerB = NewNetbirdHandler(preSharedKey, link.wgKeyB)
+-
+-	link.handlerA.SetInterface(link.ifaceA)
+-	link.handlerB.SetInterface(link.ifaceB)
+-
+-	link.handlerA.AddPeer(link.pidB, "wt0", rp.Key(link.wgKeyB))
+-	link.handlerB.AddPeer(link.pidA, "wt0", rp.Key(link.wgKeyA))
+-
+-	return link
+-}
+-
+-// complete simulates a completed rosenpass exchange: both ends derive the
+-// same output key.
+-func (l *handlerTestLink) complete(osk rp.Key) {
+-	l.handlerA.HandshakeCompleted(l.pidB, osk)
+-	l.handlerB.HandshakeCompleted(l.pidA, osk)
+-}
+-
+-// expire simulates a failed key renewal on both ends.
+-func (l *handlerTestLink) expire() {
+-	l.handlerA.HandshakeExpired(l.pidB)
+-	l.handlerB.HandshakeExpired(l.pidA)
+-}
+-
+-func lastPSK(t *testing.T, m *mockIface) wgtypes.Key {
+-	t.Helper()
+-	m.mu.Lock()
+-	defer m.mu.Unlock()
+-	require.NotEmpty(t, m.calls, "expected at least one SetPresharedKey call")
+-	return m.calls[len(m.calls)-1].psk
+-}
+-
+-func TestHandshakeCompleted_SetsKeyAndInitializes(t *testing.T) {
+-	link := newHandlerTestLink(t, nil)
+-
+-	var osk rp.Key
+-	osk[0] = 0x42
+-	link.complete(osk)
+-
+-	require.Equal(t, wgtypes.Key(osk), lastPSK(t, link.ifaceA), "completed exchange must program the osk")
+-	require.False(t, link.ifaceA.calls[0].updateOnly, "first rotation must not be update-only")
+-	require.True(t, link.handlerA.IsPeerInitialized(link.pidB), "peer must be initialized after first completed exchange")
+-
+-	link.complete(osk)
+-	require.True(t, link.ifaceA.calls[1].updateOnly, "later rotations must be update-only")
+-}
+-
+-// TestHandshakeExpired_BothSidesConverge encodes the core recovery invariant:
+-// rosenpass renewals run over the tunnel that the PSK itself keys, so when a
+-// renewal fails on both ends, both ends must fall back to the same key or the
+-// tunnel can never handshake again.
+-func TestHandshakeExpired_BothSidesConverge(t *testing.T) {
+-	link := newHandlerTestLink(t, nil)
+-
+-	var osk rp.Key
+-	osk[0] = 0x42
+-	link.complete(osk)
+-
+-	link.expire()
+-	keyA := lastPSK(t, link.ifaceA)
+-	keyB := lastPSK(t, link.ifaceB)
+-	require.NotEqual(t, wgtypes.Key(osk), keyA, "expired key must be rotated out")
+-	require.Equal(t, keyA, keyB, "both ends must converge on the same key after expiry")
+-
+-	link.expire()
+-	require.Equal(t, lastPSK(t, link.ifaceA), lastPSK(t, link.ifaceB),
+-		"both ends must still converge after repeated expiries")
+-}
+-
+-// TestHandshakeExpired_ExpiryWithoutCompletionConverges covers the bootstrap
+-// case: the initial exchange never completed (the tunnel ran on the rendezvous
+-// key), so an expiry must not replace the working key with an unrecoverable
+-// one on either end.
+-func TestHandshakeExpired_ExpiryWithoutCompletionConverges(t *testing.T) {
+-	link := newHandlerTestLink(t, nil)
+-
+-	link.expire()
+-	require.Equal(t, lastPSK(t, link.ifaceA), lastPSK(t, link.ifaceB),
+-		"both ends must converge when the exchange never completed")
+-}
+-
+-// TestHandshakeExpired_RepeatedExpiryClearsInitialized: once renewals keep
+-// failing, the peer must drop out of the initialized state so the next
+-// connection reconfiguration reprograms the rendezvous key instead of
+-// preserving a poisoned rosenpass-managed key.
+-func TestHandshakeExpired_RepeatedExpiryClearsInitialized(t *testing.T) {
+-	link := newHandlerTestLink(t, nil)
+-
+-	var osk rp.Key
+-	osk[0] = 0x42
+-	link.complete(osk)
+-
+-	link.expire()
+-	link.expire()
+-
+-	require.False(t, link.handlerA.IsPeerInitialized(link.pidB),
+-		"repeated expiries must clear the initialized state")
+-	require.False(t, link.handlerB.IsPeerInitialized(link.pidA),
+-		"repeated expiries must clear the initialized state")
+-}
+-
+-// TestHandshakeCompleted_AfterExpiryRecovers: a completed exchange after a
+-// desync must fully reset the recovery state.
+-func TestHandshakeCompleted_AfterExpiryRecovers(t *testing.T) {
+-	link := newHandlerTestLink(t, nil)
+-
+-	var osk1, osk2 rp.Key
+-	osk1[0] = 1
+-	osk2[0] = 2
+-
+-	link.complete(osk1)
+-	link.expire()
+-	link.expire()
+-
+-	link.complete(osk2)
+-	require.Equal(t, wgtypes.Key(osk2), lastPSK(t, link.ifaceA), "new exchange must program the fresh osk")
+-	require.True(t, link.handlerA.IsPeerInitialized(link.pidB), "peer must be initialized again after recovery")
+-
+-	link.expire()
+-	require.Equal(t, lastPSK(t, link.ifaceA), lastPSK(t, link.ifaceB),
+-		"recovered link must converge again on the next expiry")
+-	require.NotEqual(t, wgtypes.Key(osk2), lastPSK(t, link.ifaceA), "expired key must be rotated out")
+-}
+-
+-// TestHandshakeExpired_FirstExpiryRatchetsLastKey: the first expiry must
+-// derive the replacement from the last shared key, so an attacker who only
+-// blocks the renewal exchange gains nothing over the previous key.
+-func TestHandshakeExpired_FirstExpiryRatchetsLastKey(t *testing.T) {
+-	link := newHandlerTestLink(t, nil)
+-
+-	var osk rp.Key
+-	osk[0] = 0x42
+-	link.complete(osk)
+-
+-	link.expire()
+-	require.Equal(t, RatchetKey(wgtypes.Key(osk)), lastPSK(t, link.ifaceA),
+-		"first expiry must program the ratcheted key")
+-	require.True(t, link.handlerA.IsPeerInitialized(link.pidB),
+-		"ratchet step must keep the peer initialized so reconfigurations preserve the key")
+-}
+-
+-// TestHandshakeExpired_RepeatedExpiryFallsBackToSeed: once the ratchet key
+-// also fails, both ends must land on the same key that peer connections
+-// program for uninitialized peers, so a reconnect completes the recovery.
+-func TestHandshakeExpired_RepeatedExpiryFallsBackToSeed(t *testing.T) {
+-	link := newHandlerTestLink(t, nil)
+-
+-	var osk rp.Key
+-	osk[0] = 0x42
+-	link.complete(osk)
+-
+-	link.expire()
+-	link.expire()
+-
+-	seed, err := DeterministicSeedKey(link.wgKeyA.String(), link.wgKeyB.String())
+-	require.NoError(t, err)
+-	require.Equal(t, *seed, lastPSK(t, link.ifaceA), "repeated expiry must fall back to the seed key")
+-	require.Equal(t, *seed, lastPSK(t, link.ifaceB), "repeated expiry must fall back to the seed key")
+-}
+-
+-// TestHandshakeExpired_ConfiguredPSKUsedAsRendezvous: with an account-level
+-// preshared key configured, the fallback must be that key, matching what peer
+-// connections program for uninitialized peers.
+-func TestHandshakeExpired_ConfiguredPSKUsedAsRendezvous(t *testing.T) {
+-	psk := &[32]byte{0x77}
+-	link := newHandlerTestLink(t, psk)
+-
+-	var osk rp.Key
+-	osk[0] = 0x42
+-	link.complete(osk)
+-
+-	link.expire()
+-	link.expire()
+-
+-	require.Equal(t, wgtypes.Key(*psk), lastPSK(t, link.ifaceA),
+-		"fallback must be the configured preshared key")
+-	require.Equal(t, wgtypes.Key(*psk), lastPSK(t, link.ifaceB),
+-		"fallback must be the configured preshared key on both ends")
+-}
+-
+-// TestHandshakeExpired_ExpiryWritesAreUpdateOnly: expiry replacements must
+-// never create a WireGuard peer that connection management has removed.
+-func TestHandshakeExpired_ExpiryWritesAreUpdateOnly(t *testing.T) {
+-	link := newHandlerTestLink(t, nil)
+-
+-	var osk rp.Key
+-	osk[0] = 0x42
+-	link.complete(osk)
+-
+-	link.expire()
+-	link.expire()
+-
+-	for _, call := range link.ifaceA.calls[1:] {
+-		require.True(t, call.updateOnly, "expiry writes must be update-only")
+-	}
+-}
+-
+-// TestAddPeer_ReAddKeepsRecoveryState: reconnections re-add the peer on every
+-// OnConnected; that must not reset the expiry chain state.
+-func TestAddPeer_ReAddKeepsRecoveryState(t *testing.T) {
+-	link := newHandlerTestLink(t, nil)
+-
+-	var osk rp.Key
+-	osk[0] = 0x42
+-	link.complete(osk)
+-	link.expire()
+-
+-	link.handlerA.AddPeer(link.pidB, "wt0", rp.Key(link.wgKeyB))
+-	require.True(t, link.handlerA.IsPeerInitialized(link.pidB),
+-		"re-adding a known peer must keep its state")
+-
+-	link.expire()
+-	seed, err := DeterministicSeedKey(link.wgKeyA.String(), link.wgKeyB.String())
+-	require.NoError(t, err)
+-	require.Equal(t, *seed, lastPSK(t, link.ifaceA),
+-		"second expiry after re-add must continue to the seed fallback")
+-}
+diff --git a/client/server/state_linux.go b/client/server/state_linux.go
+index b193d4d..b261aae 100644
+--- a/client/server/state_linux.go
++++ b/client/server/state_linux.go
+@@ -3,8 +3,6 @@
+ package server
+ 
+ import (
+-	"github.com/netbirdio/netbird/client/firewall/iptables"
+-	"github.com/netbirdio/netbird/client/firewall/nftables"
+ 	"github.com/netbirdio/netbird/client/internal/dns"
+ 	"github.com/netbirdio/netbird/client/internal/routemanager/systemops"
+ 	"github.com/netbirdio/netbird/client/internal/statemanager"
+@@ -15,7 +13,5 @@ import (
+ func registerStates(mgr *statemanager.Manager) {
+ 	mgr.RegisterState(&dns.ShutdownState{})
+ 	mgr.RegisterState(&systemops.ShutdownState{})
+-	mgr.RegisterState(&nftables.ShutdownState{})
+-	mgr.RegisterState(&iptables.ShutdownState{})
+ 	mgr.RegisterState(&config.ShutdownState{})
+ }
+diff --git a/shared/relay/client/dialers_generic.go b/shared/relay/client/dialers_generic.go
+index 95e3193..56426df 100644
+--- a/shared/relay/client/dialers_generic.go
++++ b/shared/relay/client/dialers_generic.go
+@@ -5,7 +5,6 @@ package client
+ import (
+ 	"github.com/netbirdio/netbird/client/iface"
+ 	"github.com/netbirdio/netbird/shared/relay/client/dialer"
+-	"github.com/netbirdio/netbird/shared/relay/client/dialer/quic"
+ 	"github.com/netbirdio/netbird/shared/relay/client/dialer/ws"
+ )
+ 
+@@ -34,12 +33,12 @@ func (c *Client) baseDialers(mode TransportMode) []dialer.DialeFn {
+ 		return []dialer.DialeFn{ws.Dialer{}}
+ 	case TransportModeQUIC:
+ 		c.log.Infof("%s=quic, using QUIC transport", EnvRelayTransport)
+-		return []dialer.DialeFn{quic.Dialer{}}
++		return []dialer.DialeFn{ws.Dialer{}}
+ 	}
+ 
+-	all := []dialer.DialeFn{quic.Dialer{}, ws.Dialer{}}
++	all := []dialer.DialeFn{ws.Dialer{}, ws.Dialer{}}
+ 	if mode == TransportModePreferWS {
+-		all = []dialer.DialeFn{ws.Dialer{}, quic.Dialer{}}
++		all = []dialer.DialeFn{ws.Dialer{}, ws.Dialer{}}
+ 	}
+ 
+ 	if c.mtu > 0 && c.mtu > iface.DefaultMTU {

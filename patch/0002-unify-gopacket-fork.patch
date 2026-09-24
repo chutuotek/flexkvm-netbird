@@ -1,0 +1,176 @@
+diff --git a/client/firewall/uspfilter/conntrack/icmp.go b/client/firewall/uspfilter/conntrack/icmp.go
+index 3c96548..8129c1d 100644
+--- a/client/firewall/uspfilter/conntrack/icmp.go
++++ b/client/firewall/uspfilter/conntrack/icmp.go
+@@ -9,7 +9,7 @@ import (
+ 	"sync"
+ 	"time"
+ 
+-	"github.com/google/gopacket/layers"
++	"github.com/gopacket/gopacket/layers"
+ 	"github.com/google/uuid"
+ 
+ 	nblog "github.com/netbirdio/netbird/client/firewall/uspfilter/log"
+diff --git a/client/firewall/uspfilter/filter.go b/client/firewall/uspfilter/filter.go
+index 5e1366c..689a311 100644
+--- a/client/firewall/uspfilter/filter.go
++++ b/client/firewall/uspfilter/filter.go
+@@ -14,8 +14,8 @@ import (
+ 	"sync/atomic"
+ 	"time"
+ 
+-	"github.com/google/gopacket"
+-	"github.com/google/gopacket/layers"
++	"github.com/gopacket/gopacket"
++	"github.com/gopacket/gopacket/layers"
+ 	"github.com/google/uuid"
+ 	"github.com/hashicorp/go-multierror"
+ 	log "github.com/sirupsen/logrus"
+diff --git a/client/firewall/uspfilter/nat.go b/client/firewall/uspfilter/nat.go
+index 06312aa..a0bdfd3 100644
+--- a/client/firewall/uspfilter/nat.go
++++ b/client/firewall/uspfilter/nat.go
+@@ -7,8 +7,8 @@ import (
+ 	"net/netip"
+ 	"slices"
+ 
+-	"github.com/google/gopacket"
+-	"github.com/google/gopacket/layers"
++	"github.com/gopacket/gopacket"
++	"github.com/gopacket/gopacket/layers"
+ 
+ 	firewall "github.com/netbirdio/netbird/client/firewall/manager"
+ 	nblog "github.com/netbirdio/netbird/client/firewall/uspfilter/log"
+diff --git a/client/firewall/uspfilter/peer_index.go b/client/firewall/uspfilter/peer_index.go
+index 552ffd2..5481246 100644
+--- a/client/firewall/uspfilter/peer_index.go
++++ b/client/firewall/uspfilter/peer_index.go
+@@ -4,8 +4,8 @@ import (
+ 	"net/netip"
+ 	"slices"
+ 
+-	"github.com/google/gopacket"
+-	"github.com/google/gopacket/layers"
++	"github.com/gopacket/gopacket"
++	"github.com/gopacket/gopacket/layers"
+ 
+ 	firewall "github.com/netbirdio/netbird/client/firewall/manager"
+ )
+diff --git a/client/firewall/uspfilter/rule.go b/client/firewall/uspfilter/rule.go
+index 6d73b19..7cca7d3 100644
+--- a/client/firewall/uspfilter/rule.go
++++ b/client/firewall/uspfilter/rule.go
+@@ -3,7 +3,7 @@ package uspfilter
+ import (
+ 	"net/netip"
+ 
+-	"github.com/google/gopacket"
++	"github.com/gopacket/gopacket"
+ 
+ 	firewall "github.com/netbirdio/netbird/client/firewall/manager"
+ )
+diff --git a/client/firewall/uspfilter/tracer.go b/client/firewall/uspfilter/tracer.go
+index 3c08131..7f72b8b 100644
+--- a/client/firewall/uspfilter/tracer.go
++++ b/client/firewall/uspfilter/tracer.go
+@@ -7,8 +7,8 @@ import (
+ 	"strconv"
+ 	"time"
+ 
+-	"github.com/google/gopacket"
+-	"github.com/google/gopacket/layers"
++	"github.com/gopacket/gopacket"
++	"github.com/gopacket/gopacket/layers"
+ 
+ 	fw "github.com/netbirdio/netbird/client/firewall/manager"
+ 	"github.com/netbirdio/netbird/client/firewall/uspfilter/conntrack"
+diff --git a/client/iface/wgproxy/ebpf/wrapper.go b/client/iface/wgproxy/ebpf/wrapper.go
+index f75e21a..97b334a 100644
+--- a/client/iface/wgproxy/ebpf/wrapper.go
++++ b/client/iface/wgproxy/ebpf/wrapper.go
+@@ -10,8 +10,8 @@ import (
+ 	"net"
+ 	"sync"
+ 
+-	"github.com/google/gopacket"
+-	"github.com/google/gopacket/layers"
++	"github.com/gopacket/gopacket"
++	"github.com/gopacket/gopacket/layers"
+ 	log "github.com/sirupsen/logrus"
+ 
+ 	"github.com/netbirdio/netbird/client/iface/bufsize"
+diff --git a/client/iface/wgproxy/udp/rawsocket.go b/client/iface/wgproxy/udp/rawsocket.go
+index cc099d9..3f77063 100644
+--- a/client/iface/wgproxy/udp/rawsocket.go
++++ b/client/iface/wgproxy/udp/rawsocket.go
+@@ -6,8 +6,8 @@ import (
+ 	"fmt"
+ 	"net"
+ 
+-	"github.com/google/gopacket"
+-	"github.com/google/gopacket/layers"
++	"github.com/gopacket/gopacket"
++	"github.com/gopacket/gopacket/layers"
+ 	log "github.com/sirupsen/logrus"
+ 
+ 	"github.com/netbirdio/netbird/client/iface/wgproxy/rawsocket"
+diff --git a/client/internal/dns/response_writer.go b/client/internal/dns/response_writer.go
+index 287cf28..c0cca15 100644
+--- a/client/internal/dns/response_writer.go
++++ b/client/internal/dns/response_writer.go
+@@ -4,8 +4,8 @@ import (
+ 	"fmt"
+ 	"net"
+ 
+-	"github.com/google/gopacket"
+-	"github.com/google/gopacket/layers"
++	"github.com/gopacket/gopacket"
++	"github.com/gopacket/gopacket/layers"
+ 	"github.com/miekg/dns"
+ 	"golang.zx2c4.com/wireguard/tun"
+ )
+diff --git a/client/internal/dns/service_memory.go b/client/internal/dns/service_memory.go
+index e8c0360..b29cc33 100644
+--- a/client/internal/dns/service_memory.go
++++ b/client/internal/dns/service_memory.go
+@@ -6,8 +6,8 @@ import (
+ 	"net/netip"
+ 	"sync"
+ 
+-	"github.com/google/gopacket"
+-	"github.com/google/gopacket/layers"
++	"github.com/gopacket/gopacket"
++	"github.com/gopacket/gopacket/layers"
+ 	"github.com/miekg/dns"
+ 	log "github.com/sirupsen/logrus"
+ 
+diff --git a/sharedsock/sock_linux.go b/sharedsock/sock_linux.go
+index 150e8a7..bc2763d 100644
+--- a/sharedsock/sock_linux.go
++++ b/sharedsock/sock_linux.go
+@@ -12,8 +12,8 @@ import (
+ 	"net"
+ 	"time"
+ 
+-	"github.com/google/gopacket"
+-	"github.com/google/gopacket/layers"
++	"github.com/gopacket/gopacket"
++	"github.com/gopacket/gopacket/layers"
+ 	"github.com/mdlayher/socket"
+ 	log "github.com/sirupsen/logrus"
+ 	"github.com/vishvananda/netlink"
+diff --git a/util/capture/text.go b/util/capture/text.go
+index 3222989..b075828 100644
+--- a/util/capture/text.go
++++ b/util/capture/text.go
+@@ -10,8 +10,8 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/google/gopacket"
+-	"github.com/google/gopacket/layers"
++	"github.com/gopacket/gopacket"
++	"github.com/gopacket/gopacket/layers"
+ 	"github.com/miekg/dns"
+ 
+ 	nbdns "github.com/netbirdio/netbird/dns"
