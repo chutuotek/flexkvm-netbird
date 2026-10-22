@@ -1,7 +1,7 @@
 #
 # NetBird (client) ARMv7 Cross-Compilation Makefile
 # Target Platform: RV1106 (arm-rockchip830-linux-uclibcgnueabihf)
-# Tag: v0.81.3
+# Tag: v0.79.0
 #
 # netbird 客户端是纯 Go：CGO_ENABLED=0 编出来是完全静态的，不依赖目标机 libc
 # 版本，所以在 uClibc 根文件系统上直接能跑（client/ 里唯一的 import "C" 在
@@ -35,6 +35,10 @@ NETBIRD_SRC := $(CURDIR)/netbird
 # Number of parallel jobs
 JOBS ?= $(shell nproc)
 
+# C 控制台用的交叉编译器（netbird 本体是纯 Go，只有 CLI 需要 C 工具链）
+CROSS_COMPILE ?= arm-rockchip830-linux-uclibcgnueabihf-
+CC_CLI := $(CROSS_COMPILE)gcc
+
 # 禁用内联以缩小体积（约 -12%）。
 # 必须带 all= 前缀，否则只作用于 ./client 本身、不含依赖包，等于无效
 GCFLAGS ?= all=-l
@@ -52,9 +56,29 @@ else
 endif
 PATCH_COUNT := $(words $(PATCHES))
 
-.PHONY: all clean clone build install info help
+# ---- C 控制台（替代官方 netbird CLI）----
+#
+# netbird 的 CLI 与 daemon 是**同一个二进制里的子命令**（client/main.go 只有
+# 15 行，直接 cmd.Execute()），所以删不掉：只要 netbird 在，CLI 就在。
+#
+# 这里额外提供一个功能等价的 C 版控制台，体积 33 KB，走 netbird 自己的
+# grpc-gateway JSON socket（--enable-json-socket），不 popen 任何东西。
+# 附带好处：官方 CLI 一次调用要做进程启动 + gRPC，C 版是纯 HTTP 往返。
+#
+# 注意：**必须**让 daemon 带 --enable-json-socket 启动，否则只有 gRPC
+# socket，C 版连不上（见 flexkvm-netbird/README.md 的运行时一节）。
+CLI_ENABLE ?= 1
+LIB_DIR    := $(CURDIR)/../lib
+LIB_A      := $(LIB_DIR)/out/libvpnctl.a
+CLI_BIN    := $(OUTPUT_DIR)/netbird-cli
+CLI_SRC    := $(CURDIR)/cli/netbird-cli.c
+CLI_CFLAGS := -std=c17 -O2 -Wall -Wextra
+CLI_LDLIBS := -ljansson
+NB_SYSROOT ?= $(shell ls -d /root/rv1106/flexkvm_sdk/sysdrv/source/buildroot/buildroot-*/output/host/arm-buildroot-linux-uclibcgnueabihf/sysroot 2>/dev/null | head -1)
 
-all: info clone build install
+.PHONY: all clean clone build cli lib install info help
+
+all: info clone build cli install
 	@echo "Build $(PKG_NAME) done"
 
 info:
@@ -106,7 +130,21 @@ build: clone
 			-o $(CURDIR)/$(PKG_BIN)/netbird ./client \
 	)
 
-install: build
+lib:
+	@$(MAKE) -C $(LIB_DIR)
+
+cli: lib
+	@echo "Building C console (netbird-cli)..."
+	@mkdir -p $(OUTPUT_DIR)
+	@$(CC_CLI) $(CLI_CFLAGS) \
+		$(if $(NB_SYSROOT),--sysroot=$(NB_SYSROOT) -I$(NB_SYSROOT)/usr/include) \
+		-I$(LIB_DIR)/include \
+		$(CLI_SRC) $(LIB_A) \
+		$(if $(NB_SYSROOT),-L$(NB_SYSROOT)/usr/lib) \
+		$(CLI_LDLIBS) -o $(CLI_BIN)
+	@echo "  -> $(CLI_BIN)"
+
+install: build cli
 	@echo "Binary ready in $(OUTPUT_DIR)/"
 ifeq ($(UPX),1)
 	@echo ""
@@ -115,6 +153,7 @@ ifeq ($(UPX),1)
 endif
 	@echo ""
 	@echo "Installed files:"
+	@test -f $(CLI_BIN) && { which $(CROSS_COMPILE)strip >/dev/null 2>&1 && $(CROSS_COMPILE)strip $(CLI_BIN) || true; } || true
 	@ls -lh $(OUTPUT_DIR)/
 
 clean:
@@ -130,7 +169,8 @@ help:
 	@echo "  make          - Build netbird client (trimmed) and compress with upx"
 	@echo "  make clone    - Checkout pinned netbird submodule tag"
 	@echo "  make build    - Build only"
-	@echo "  make install  - Build and compress with upx"
+	@echo "  make cli      - Build the C console (netbird-cli)"
+	@echo "  make install  - Build (+ C console) and compress with upx"
 	@echo "  make clean    - Clean build artifacts and revert patches"
 	@echo "  make help     - Show this help"
 	@echo ""

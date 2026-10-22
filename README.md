@@ -104,3 +104,57 @@ out/
   -trimpath -buildvcs=false -gcflags='all=-l'`
   > `-gcflags` 必须带 `all=` 前缀，否则只作用于 `./client` 本身、不含依赖包，等于无效。
   > `-buildvcs=false` 让二进制版本固定输出 `0.81.3`（否则会带上 `-dirty` 后缀）。
+
+## C 控制台（`netbird-cli`）
+
+**官方 netbird CLI 无法移除**：它与 daemon 是同一个二进制里的子命令
+（`client/main.go` 只有 15 行，直接 `cmd.Execute()`）。裁剪补丁已删掉
+19 个 `client/cmd` 文件，但主命令面仍在。
+
+因此额外提供功能等价的 C 版：
+
+```bash
+make cli      # → out/netbird-cli
+```
+
+| | |
+|---|---|
+| 体积 | **26 KB** |
+| 通信 | netbird 自己的 **grpc-gateway JSON socket**（HTTP/JSON over unix socket）|
+| 依赖 | `libvpnctl.a` + jansson |
+
+命令面（8 个，全部实测）：`status` / `up` / `down` / `login` / `logout` /
+`getconfig` / `features` / `version`
+
+### 关键前提：daemon 必须带 `--enable-json-socket`
+
+netbird 的控制面默认是 gRPC，C 侧讲不了。必须这样启动：
+
+```bash
+./netbird service run \
+    --config /userdata/netbird/default.json \
+    --daemon-addr unix:///userdata/netbird/nb.sock \
+    --enable-json-socket --json-socket unix:///userdata/netbird/nb-http.sock
+```
+
+### 路由规则
+
+`daemon.proto` 里没有 `google.api.http` 注解，所以路径是 grpc-gateway 的
+**默认推导**，大小写敏感：
+
+```
+POST /daemon.DaemonService/<MethodName>
+```
+
+实测 `/status`、`/api/status`、`/daemon.DaemonService/status` 全部 404。
+
+### 错误处理有个坑
+
+netbird 业务失败时**仍返回 HTTP 200**，错误在正文
+`{"code":7,"message":"..."}`。必须解析正文而不是只看状态码——
+实测 `Up` 失败返回的是 HTTP 500 + code 2，只看状态码会丢掉真实原因。
+
+### 安全
+
+socket 默认权限是 **0666**（上游行为）。本 CLI 在 `up`/`login` 成功后会尝试
+`chmod 0600`，失败只告警不中断。产品侧应在启动脚本里显式收紧。
