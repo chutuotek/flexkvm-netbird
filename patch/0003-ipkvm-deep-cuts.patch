@@ -1,8 +1,8 @@
 diff --git a/client/firewall/create_linux.go b/client/firewall/create_linux.go
-index d585e85..da94114 100644
+index d585e85d7..edfd09a70 100644
 --- a/client/firewall/create_linux.go
 +++ b/client/firewall/create_linux.go
-@@ -3,240 +3,15 @@
+@@ -3,240 +3,13 @@
  package firewall
  
  import (
@@ -242,19 +242,17 @@ index d585e85..da94114 100644
 -		return false
 -	}
 -	return force
-+// IP-KVM trim: neither the native backends (iptables/nftables) nor the
-+// userspace packet filter are built in any more, so the client runs without a
-+// local ACL engine. Route setup, the interface and connectivity are
-+// unaffected; only locally-installed filter/NAT rules are gone.
++// IP-KVM 裁剪：iptables/nftables 后端与用户态包过滤都不再编译进来，
++// 客户端因此没有本地 ACL 引擎。这里恒返回 no-op 实现。
 +func NewFirewall(_ IFaceMapper, _ *statemanager.Manager, _ nftypes.FlowLogger, _ bool, _ uint16) (firewall.Manager, error) {
 +	return nopManager{}, nil
  }
 diff --git a/client/firewall/nop.go b/client/firewall/nop.go
 new file mode 100644
-index 0000000..f1dde34
+index 000000000..d88e34e01
 --- /dev/null
 +++ b/client/firewall/nop.go
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,52 @@
 +//go:build !android
 +
 +package firewall
@@ -268,7 +266,11 @@ index 0000000..f1dde34
 +	"github.com/netbirdio/netbird/client/internal/statemanager"
 +)
 +
-+// nopManager is a firewall.Manager that installs nothing.
++// nopManager 是"什么都不装"的 firewall.Manager。
++//
++// IP-KVM 裁剪：iptables/nftables 后端与用户态包过滤（uspfilter）都不再编译进来，
++// 因此客户端没有本地 ACL 引擎。路由、网卡与连通性不受影响，丢掉的只是
++// 本地安装的 filter/NAT 规则——即管理端下发的访问策略不会在本机强制执行。
 +type nopManager struct{}
 +
 +var _ firewall.Manager = nopManager{}
@@ -290,22 +292,24 @@ index 0000000..f1dde34
 +func (nopManager) SetLogLevel(log.Level)                   {}
 +func (nopManager) EnableRouting() error                    { return nil }
 +func (nopManager) DisableRouting() error                   { return nil }
++func (nopManager) UpdateSet(firewall.Set, []netip.Prefix) error { return nil }
 +
-+func (nopManager) AddDNATRule(firewall.ForwardRule) (firewall.Rule, error) { return nil, nil }
-+func (nopManager) DeleteDNATRule(firewall.Rule) error                      { return nil }
-+func (nopManager) UpdateSet(firewall.Set, []netip.Prefix) error            { return nil }
-+func (nopManager) AddInboundDNAT(netip.Addr, firewall.Protocol, uint16, uint16) error    { return nil }
-+func (nopManager) RemoveInboundDNAT(netip.Addr, firewall.Protocol, uint16, uint16) error { return nil }
-+func (nopManager) AddOutputDNAT(netip.Addr, firewall.Protocol, uint16, uint16) error     { return nil }
-+func (nopManager) RemoveOutputDNAT(netip.Addr, firewall.Protocol, uint16, uint16) error  { return nil }
-+func (nopManager) SetupEBPFProxyNoTrack(uint16, uint16) error { return nil }
-+func (nopManager) RemoveAllLegacyRouteRules() error           { return nil }
-+func (nopManager) GetLegacyManagement() bool                  { return false }
++func (nopManager) AddInboundDNAT(netip.Addr, firewall.Protocol, uint16, uint16) error { return nil }
++
++func (nopManager) RemoveInboundDNAT(netip.Addr, firewall.Protocol, uint16, uint16) error {
++	return nil
++}
++
++func (nopManager) AddOutputDNAT(netip.Addr, firewall.Protocol, uint16, uint16) error { return nil }
++
++func (nopManager) RemoveOutputDNAT(netip.Addr, firewall.Protocol, uint16, uint16) error {
++	return nil
++}
 diff --git a/client/iface/wgproxy/factory_kernel.go b/client/iface/wgproxy/factory_kernel.go
-index 7821df3..e774cce 100644
+index 0b2329b96..bf25bd91a 100644
 --- a/client/iface/wgproxy/factory_kernel.go
 +++ b/client/iface/wgproxy/factory_kernel.go
-@@ -3,81 +3,24 @@
+@@ -3,84 +3,33 @@
  package wgproxy
  
  import (
@@ -314,21 +318,31 @@ index 7821df3..e774cce 100644
 -
 -	log "github.com/sirupsen/logrus"
 -
--	"github.com/netbirdio/netbird/client/iface/wgproxy/ebpf"
+-	"github.com/netbirdio/netbird/client/iface/wgproxy/loopback"
  	udpProxy "github.com/netbirdio/netbird/client/iface/wgproxy/udp"
  )
  
 -const (
+-	envDisableKernelWGProxy = "NB_DISABLE_KERNEL_WG_PROXY"
+-	// envDisableEBPFWGProxy is a deprecated alias for envDisableKernelWGProxy.
 -	envDisableEBPFWGProxy = "NB_DISABLE_EBPF_WG_PROXY"
 -)
--
-+// IP-KVM trim: the eBPF WireGuard proxy is not built in, so the factory always
-+// produces the userspace UDP proxy (same behaviour as NB_DISABLE_EBPF_WG_PROXY=true).
++/*
++ * IP-KVM 裁剪：恒用用户态 UDP 代理。
++ *
++ * 上游这条路径会先尝试 loopback proxy（需要内核 WireGuard 支持 + 额外的
++ * 回环 socket）。在 RV1106 上内核没有 wireguard 模块，那次尝试只会白跑一次
++ * 并且多开一组 socket，所以直接跳过，与设置 NB_DISABLE_KERNEL_WG_PROXY=true
++ * 的行为一致。
++ *
++ * 代价：没有内核态 WG 转发（本来也没有），用户态转发已实测可用。
++ */
+ 
  type KernelFactory struct {
  	wgPort int
  	mtu    uint16
 -
--	ebpfProxy *ebpf.WGEBPFProxy
+-	loopbackProxy *loopback.Proxy
  }
  
  func NewKernelFactory(wgPort int, mtu uint16) *KernelFactory {
@@ -337,67 +351,68 @@ index 7821df3..e774cce 100644
 -		mtu:    mtu,
 -	}
 -
--	if isEBPFDisabled() {
+-	if isKernelProxyDisabled() {
 -		log.Infof("WireGuard Proxy Factory will produce UDP proxy")
--		log.Infof("eBPF WireGuard proxy is disabled via %s environment variable", envDisableEBPFWGProxy)
 -		return f
 -	}
 -
--	ebpfProxy := ebpf.NewWGEBPFProxy(wgPort, mtu)
--	if err := ebpfProxy.Listen(); err != nil {
+-	loopbackProxy := loopback.NewProxy(wgPort, mtu)
+-	if err := loopbackProxy.Listen(); err != nil {
 -		log.Infof("WireGuard Proxy Factory will produce UDP proxy")
--		log.Warnf("failed to initialize ebpf proxy, fallback to user space proxy: %s", err)
+-		log.Warnf("failed to initialize loopback proxy, fallback to user space proxy: %s", err)
 -		return f
 -	}
--	log.Infof("WireGuard Proxy Factory will produce eBPF proxy")
--	f.ebpfProxy = ebpfProxy
+-	log.Infof("WireGuard Proxy Factory will produce loopback proxy")
+-	f.loopbackProxy = loopbackProxy
 -	return f
 +	return &KernelFactory{wgPort: wgPort, mtu: mtu}
  }
  
  func (w *KernelFactory) GetProxy() Proxy {
--	if w.ebpfProxy == nil {
+-	if w.loopbackProxy == nil {
 -		return udpProxy.NewWGUDPProxy(w.wgPort, w.mtu)
 -	}
 -
--	return ebpf.NewProxyWrapper(w.ebpfProxy)
+-	return loopback.NewProxyWrapper(w.loopbackProxy)
 -}
 -
--// GetProxyPort returns the eBPF proxy port, or 0 if eBPF is not active.
--func (w *KernelFactory) GetProxyPort() uint16 {
--	if w.ebpfProxy == nil {
--		return 0
+-func (w *KernelFactory) Free() error {
+-	if w.loopbackProxy == nil {
+-		return nil
 -	}
--	return w.ebpfProxy.GetProxyPort()
+-	return w.loopbackProxy.Free()
 +	return udpProxy.NewWGUDPProxy(w.wgPort, w.mtu)
  }
  
--func (w *KernelFactory) Free() error {
--	if w.ebpfProxy == nil {
--		return nil
+-func isKernelProxyDisabled() bool {
+-	env := envDisableKernelWGProxy
+-	val := os.Getenv(env)
+-	if val == "" {
+-		env = envDisableEBPFWGProxy
+-		val = os.Getenv(env)
 -	}
--	return w.ebpfProxy.Free()
--}
-+func (w *KernelFactory) GetProxyPort() uint16 { return 0 }
- 
--func isEBPFDisabled() bool {
--	val := os.Getenv(envDisableEBPFWGProxy)
 -	if val == "" {
 -		return false
 -	}
++func (w *KernelFactory) GetProxyPort() uint16 { return 0 }
+ 
 -	disabled, err := strconv.ParseBool(val)
 -	if err != nil {
--		log.Warnf("failed to parse %s: %v", envDisableEBPFWGProxy, err)
+-		log.Warnf("failed to parse %s: %v", env, err)
 -		return false
+-	}
+-
+-	if disabled {
+-		log.Infof("kernel WireGuard proxy is disabled via %s", env)
 -	}
 -	return disabled
 -}
 +func (w *KernelFactory) Free() error { return nil }
 diff --git a/client/internal/rosenpass/manager.go b/client/internal/rosenpass/manager.go
-index 21dd751..21a8921 100644
+index 21dd751df..2cd662d38 100644
 --- a/client/internal/rosenpass/manager.go
 +++ b/client/internal/rosenpass/manager.go
-@@ -1,321 +1,39 @@
+@@ -1,321 +1,48 @@
  package rosenpass
  
  import (
@@ -427,7 +442,18 @@ index 21dd751..21a8921 100644
 -	hasher.Write(key)
 -	return hex.EncodeToString(hasher.Sum(nil))
 -}
--
++/*
++ * IP-KVM 裁剪：Rosenpass（抗量子预共享密钥）不编译进来。
++ *
++ * 这里保留 Manager 的**公开形状**，因为 client/internal/engine.go 在
++ * 多处无条件引用它（Run/Close/SetInterface/GetPubKey/GetAddress/
++ * OnConnected/OnDisconnected/IsPresharedKeyInitialized/GetProxyPort）。
++ * 删掉这些方法会让引擎编不过，进而整个客户端起不来。
++ *
++ * 行为：所有操作都是 no-op，RosenpassEnabled 恒为 false。代价是失去
++ * 抗量子 PSK 能力——对 IP-KVM 场景可接受（它只是 WireGuard 之上的增强）。
++ */
+ 
 -// rpServer is the subset of rp.Server used by Manager. Defined as an interface
 -// so tests can substitute a mock without spinning up a real UDP server.
 -type rpServer interface {
@@ -440,9 +466,6 @@ index 21dd751..21a8921 100644
 +	SetPresharedKey(peerKey string, psk wgtypes.Key, updateOnly bool) error
  }
  
-+// IP-KVM trim: Rosenpass (post-quantum pre-shared keys) is not built in. The
-+// manager keeps its public shape so the engine's optional wiring still
-+// compiles, but every operation is a no-op and RosenpassEnabled stays false.
  type Manager struct {
 -	ifaceName    string
 -	localWgKey   wgtypes.Key
@@ -545,9 +568,8 @@ index 21dd751..21a8921 100644
 -	m.rpWgHandler.AddPeer(peerID, m.ifaceName, rp.Key(key))
 -	m.rpPeerIDs[wireGuardPubKey] = &peerID
 -	return nil
-+	wgIface PresharedKeySetter
- }
- 
+-}
+-
 -// removePeer removes a peer from the Rosenpass server
 -func (m *Manager) removePeer(wireGuardPubKey string) error {
 -	err := m.server.RemovePeer(*m.rpPeerIDs[wireGuardPubKey])
@@ -556,10 +578,8 @@ index 21dd751..21a8921 100644
 -	}
 -	m.rpWgHandler.RemovePeer(*m.rpPeerIDs[wireGuardPubKey])
 -	return nil
-+func NewManager(_ *wgtypes.Key, _ string, _ wgtypes.Key) (*Manager, error) {
-+	return nil, nil
- }
- 
+-}
+-
 -func (m *Manager) generateConfig() (rp.Config, error) {
 -	opts := &slog.HandlerOptions{
 -		Level: getLogLevel(),
@@ -578,27 +598,23 @@ index 21dd751..21a8921 100644
 -		m.rpWgHandler.SetInterface(m.wgIface)
 -	}
 -	m.lock.Unlock()
-+func (m *Manager) GetPubKey() []byte { return nil }
- 
+-
 -	cfg.Handlers = []rp.Handler{m.rpWgHandler}
-+func (m *Manager) GetAddress() *net.UDPAddr { return &net.UDPAddr{} }
- 
+-
 -	port, err := findRandomAvailableUDPPort()
 -	if err != nil {
 -		log.Errorf("could not determine a random port for rosenpass server. Error: %s", err)
 -		return rp.Config{}, err
 -	}
-+func (m *Manager) Run() error { return nil }
- 
--	m.port = port
-+func (m *Manager) Close() error { return nil }
- 
--	cfg.ListenAddrs = []*net.UDPAddr{m.GetAddress()}
-+func (m *Manager) SetInterface(iface PresharedKeySetter) { m.wgIface = iface }
- 
--	return cfg, nil
--}
 -
+-	m.port = port
+-
+-	cfg.ListenAddrs = []*net.UDPAddr{m.GetAddress()}
+-
+-	return cfg, nil
++	wgIface PresharedKeySetter
+ }
+ 
 -func getLogLevel() slog.Level {
 -	level, ok := os.LookupEnv(defaultLogLevelVar)
 -	if !ok {
@@ -618,13 +634,11 @@ index 21dd751..21a8921 100644
 -		return defaultLog
 -	}
 -}
-+func (m *Manager) OnConnected(string, []byte, string, string) {}
- 
+-
 -func (m *Manager) OnDisconnected(peerKey string) {
 -	m.lock.Lock()
 -	defer m.lock.Unlock()
-+func (m *Manager) OnDisconnected(string) {}
- 
+-
 -	if _, ok := m.rpPeerIDs[peerKey]; !ok {
 -		// if we didn't have this peer yet, just skip
 -		return
@@ -636,8 +650,10 @@ index 21dd751..21a8921 100644
 -	}
 -
 -	delete(m.rpPeerIDs, peerKey)
--}
--
++func NewManager(_ *wgtypes.Key, _ string, _ wgtypes.Key) (*Manager, error) {
++	return &Manager{}, nil
+ }
+ 
 -// Run starts the Rosenpass server
 -func (m *Manager) Run() error {
 -	conf, err := m.generateConfig()
@@ -649,16 +665,20 @@ index 21dd751..21a8921 100644
 -	if err != nil {
 -		return err
 -	}
--
++func (m *Manager) GetPubKey() []byte { return nil }
+ 
 -	m.lock.Lock()
 -	m.server = server
 -	m.lock.Unlock()
--
++func (m *Manager) GetAddress() *net.UDPAddr { return &net.UDPAddr{} }
+ 
 -	log.Infof("starting rosenpass server on port %d", m.port)
--
++func (m *Manager) Run() error { return nil }
+ 
 -	return server.Run()
 -}
--
++func (m *Manager) Close() error { return nil }
+ 
 -// Close closes the Rosenpass server
 -func (m *Manager) Close() error {
 -	m.lock.Lock()
@@ -673,7 +693,8 @@ index 21dd751..21a8921 100644
 -	}
 -	return nil
 -}
--
++func (m *Manager) SetInterface(iface PresharedKeySetter) { m.wgIface = iface }
+ 
 -// SetInterface sets the WireGuard interface for the rosenpass handler.
 -// This can be called before or after Run() - the interface will be stored
 -// and passed to the handler when it's created or updated immediately if
@@ -681,13 +702,15 @@ index 21dd751..21a8921 100644
 -func (m *Manager) SetInterface(iface PresharedKeySetter) {
 -	m.lock.Lock()
 -	defer m.lock.Unlock()
--
++func (m *Manager) OnConnected(string, []byte, string, string) {}
+ 
 -	m.wgIface = iface
 -	if m.rpWgHandler != nil {
 -		m.rpWgHandler.SetInterface(iface)
 -	}
 -}
--
++func (m *Manager) OnDisconnected(string) {}
+ 
 -// OnConnected is a handler function that is triggered when a connection to a remote peer establishes
 -func (m *Manager) OnConnected(remoteWireGuardKey string, remoteRosenpassPubKey []byte, wireGuardIP string, remoteRosenpassAddr string) {
 -	m.lock.Lock()
@@ -738,7 +761,7 @@ index 21dd751..21a8921 100644
 +func (m *Manager) IsPresharedKeyInitialized(string) bool { return false }
 diff --git a/client/internal/rosenpass/manager_test.go b/client/internal/rosenpass/manager_test.go
 deleted file mode 100644
-index 69e18ac..0000000
+index 69e18ac88..000000000
 --- a/client/internal/rosenpass/manager_test.go
 +++ /dev/null
 @@ -1,412 +0,0 @@
@@ -1156,7 +1179,7 @@ index 69e18ac..0000000
 -}
 diff --git a/client/internal/rosenpass/netbird_handler.go b/client/internal/rosenpass/netbird_handler.go
 deleted file mode 100644
-index 672650c..0000000
+index 672650ca7..000000000
 --- a/client/internal/rosenpass/netbird_handler.go
 +++ /dev/null
 @@ -1,202 +0,0 @@
@@ -1364,7 +1387,7 @@ index 672650c..0000000
 -}
 diff --git a/client/internal/rosenpass/netbird_handler_test.go b/client/internal/rosenpass/netbird_handler_test.go
 deleted file mode 100644
-index 9d91ba9..0000000
+index 9d91ba93b..000000000
 --- a/client/internal/rosenpass/netbird_handler_test.go
 +++ /dev/null
 @@ -1,250 +0,0 @@
@@ -1619,7 +1642,7 @@ index 9d91ba9..0000000
 -		"second expiry after re-add must continue to the seed fallback")
 -}
 diff --git a/client/server/state_linux.go b/client/server/state_linux.go
-index b193d4d..b261aae 100644
+index b193d4dfa..b04c02eb0 100644
 --- a/client/server/state_linux.go
 +++ b/client/server/state_linux.go
 @@ -3,8 +3,6 @@
@@ -1631,7 +1654,13 @@ index b193d4d..b261aae 100644
  	"github.com/netbirdio/netbird/client/internal/dns"
  	"github.com/netbirdio/netbird/client/internal/routemanager/systemops"
  	"github.com/netbirdio/netbird/client/internal/statemanager"
-@@ -15,7 +13,5 @@ import (
+@@ -12,10 +10,11 @@ import (
+ )
+ 
+ // registerStates registers all states that need crash recovery cleanup.
++//
++// IP-KVM 裁剪：iptables / nftables 后端不再编译进来（防火墙是 no-op），
++// 对应的 ShutdownState 也就不存在，这里不能注册。
  func registerStates(mgr *statemanager.Manager) {
  	mgr.RegisterState(&dns.ShutdownState{})
  	mgr.RegisterState(&systemops.ShutdownState{})
@@ -1639,31 +1668,127 @@ index b193d4d..b261aae 100644
 -	mgr.RegisterState(&iptables.ShutdownState{})
  	mgr.RegisterState(&config.ShutdownState{})
  }
+diff --git a/go.mod b/go.mod
+index be9733e55..f6e88a437 100644
+--- a/go.mod
++++ b/go.mod
+@@ -61,12 +61,10 @@ require (
+ 	github.com/go-jose/go-jose/v4 v4.1.4
+ 	github.com/go-ole/go-ole v1.3.0
+ 	github.com/gobwas/ws v1.4.0
+-	github.com/goccy/go-yaml v1.19.2
+ 	github.com/godbus/dbus/v5 v5.2.2
+ 	github.com/golang-jwt/jwt/v5 v5.3.1
+ 	github.com/google/go-cmp v0.7.0
+ 	github.com/google/go-tpm v0.9.8
+-	github.com/google/gopacket v1.1.19
+ 	github.com/google/nftables v0.3.0
+ 	github.com/gopacket/gopacket v1.4.0
+ 	github.com/grafana/pyroscope-go v1.4.2
+@@ -81,7 +79,6 @@ require (
+ 	github.com/lrh3321/ipset-go v0.0.0-20250619021614-54a0a98ace81
+ 	github.com/magefile/mage v1.17.2
+ 	github.com/mdlayher/socket v0.5.1
+-	github.com/mdp/qrterminal/v3 v3.2.1
+ 	github.com/miekg/dns v1.1.72
+ 	github.com/mitchellh/hashstructure/v2 v2.0.2
+ 	github.com/moby/moby/api v1.54.1
+@@ -150,6 +147,8 @@ require (
+ 	howett.net/plist v1.0.2-0.20250314012144-ee69052608d9
+ )
+ 
++require github.com/goccy/go-yaml v1.19.2 // indirect
++
+ require (
+ 	cloud.google.com/go/auth v0.20.0 // indirect
+ 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
+@@ -362,7 +361,6 @@ require (
+ 	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 // indirect
+ 	gopkg.in/warnings.v0 v0.1.2 // indirect
+ 	gopkg.in/yaml.v2 v2.4.0 // indirect
+-	rsc.io/qr v0.2.0 // indirect
+ )
+ 
+ replace github.com/kardianos/service => github.com/netbirdio/service v0.0.0-20240911161631-f62744f42502
+diff --git a/go.sum b/go.sum
+index 83ef3c36d..fa78f3da7 100644
+--- a/go.sum
++++ b/go.sum
+@@ -485,8 +485,6 @@ github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 h1:A1Cq6Ysb0GM0
+ github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42/go.mod h1:BB4YCPDOzfy7FniQ/lxuYQ3dgmM2cZumHbK8RpTjN2o=
+ github.com/mdlayher/socket v0.5.1 h1:VZaqt6RkGkt2OE9l3GcC6nZkqD3xKeQLyfleW/uBcos=
+ github.com/mdlayher/socket v0.5.1/go.mod h1:TjPLHI1UgwEv5J1B5q0zTZq12A/6H7nKmtTanQE37IQ=
+-github.com/mdp/qrterminal/v3 v3.2.1 h1:6+yQjiiOsSuXT5n9/m60E54vdgFsw0zhADHhHLrFet4=
+-github.com/mdp/qrterminal/v3 v3.2.1/go.mod h1:jOTmXvnBsMy5xqLniO0R++Jmjs2sTm9dFSuQ5kpz/SU=
+ github.com/mholt/acmez/v2 v2.0.1 h1:3/3N0u1pLjMK4sNEAFSI+bcvzbPhRpY383sy1kLHJ6k=
+ github.com/mholt/acmez/v2 v2.0.1/go.mod h1:fX4c9r5jYwMyMsC+7tkYRxHibkOTgta5DIFGoe67e1U=
+ github.com/miekg/dns v1.1.72 h1:vhmr+TF2A3tuoGNkLDFK9zi36F2LS+hKTRW0Uf8kbzI=
+@@ -829,10 +827,8 @@ golang.org/x/crypto v0.55.0 h1:+KWHjbgOaAQ66dh/YlkZKHlz9ZUlq61AFirAR9ntP8M=
+ golang.org/x/crypto v0.55.0/go.mod h1:uq0V9dE/fzQuJtbnL+2EhWOE63vo164FY8xqEnV9xis=
+ golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f h1:W3F4c+6OLc6H2lb//N1q4WpJkhzJCK5J6kUi1NTVXfM=
+ golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f/go.mod h1:J1xhfL/vlindoeF/aINzNzt2Bket5bjo9sdOYzOsU80=
+-golang.org/x/lint v0.0.0-20200302205851-738671d3881b/go.mod h1:3xt1FjdF8hUf6vQPIChWIBhFzV8gjjsPE/fR3IyQdNY=
+ golang.org/x/mobile v0.0.0-20260816165457-f98cc9b3c733 h1:XKMObIaAElmkdO+4SQh1iCfzwciZHJi1OblnX9BED9k=
+ golang.org/x/mobile v0.0.0-20260816165457-f98cc9b3c733/go.mod h1:jMwjxoDSx9jqhNaZqPnr6nnKzb7cs+Dy1Czk7wdX+R8=
+-golang.org/x/mod v0.1.1-0.20191105210325-c90efee705ee/go.mod h1:QqPTAvyqsEbceGzBzNggFXnrqF1CaUcvgkdR5Ot7KZg=
+ golang.org/x/mod v0.2.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+ golang.org/x/mod v0.3.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+ golang.org/x/mod v0.4.2/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+@@ -955,7 +951,6 @@ golang.org/x/time v0.15.0 h1:bbrp8t3bGUeFOx08pvsMYRTCVSMk89u4tKbNOZbp88U=
+ golang.org/x/time v0.15.0/go.mod h1:Y4YMaQmXwGQZoFaVFk4YpCt4FLQMYKZe9oeV/f4MSno=
+ golang.org/x/tools v0.0.0-20180917221912-90fa682c2a6e/go.mod h1:n7NCudcB/nEzxVGmLbDWY5pfWTLqBcC2KZ6jyYvM4mQ=
+ golang.org/x/tools v0.0.0-20191119224855-298f0cb1881e/go.mod h1:b+2E5dAYhXwXZwtnZ6UAqBI28+e2cm9otk0dWdXHAEo=
+-golang.org/x/tools v0.0.0-20200130002326-2f3ba24bd6e7/go.mod h1:TB2adYChydJhpapKDTa4BR/hXlZSLoq2Wpct/0txZ28=
+ golang.org/x/tools v0.0.0-20200619180055-7c47624df98f/go.mod h1:EkVYQZoAsY45+roYkvgYkIh4xh/qjgUK9TdY2XT94GE=
+ golang.org/x/tools v0.0.0-20201224043029-2b0845dc783e/go.mod h1:emZCQorbCU4vsT4fOWvOPXz4eW1wZW4PmDk9uLelYpA=
+ golang.org/x/tools v0.0.0-20210106214847-113979e3529a/go.mod h1:emZCQorbCU4vsT4fOWvOPXz4eW1wZW4PmDk9uLelYpA=
+@@ -1042,5 +1037,3 @@ howett.net/plist v1.0.2-0.20250314012144-ee69052608d9 h1:eeH1AIcPvSc0Z25ThsYF+Xo
+ howett.net/plist v1.0.2-0.20250314012144-ee69052608d9/go.mod h1:fyFX5Hj5tP1Mpk8obqA9MZgXT416Q5711SDT7dQLTLk=
+ pgregory.net/rapid v1.2.0 h1:keKAYRcjm+e1F0oAuU5F5+YPAWcyxNNRK2wud503Gnk=
+ pgregory.net/rapid v1.2.0/go.mod h1:PY5XlDGj0+V1FCq0o192FdRhpKHGTRIWBgqjDBTrq04=
+-rsc.io/qr v0.2.0 h1:6vBLea5/NRMVTz8V66gipeLycZMl/+UlFmk8DvqQ6WY=
+-rsc.io/qr v0.2.0/go.mod h1:IF+uZjkb9fqyeF/4tlBoynqmQxUoPfWEKh921coOuXs=
 diff --git a/shared/relay/client/dialers_generic.go b/shared/relay/client/dialers_generic.go
-index 95e3193..56426df 100644
+index 95e319338..aff6e4990 100644
 --- a/shared/relay/client/dialers_generic.go
 +++ b/shared/relay/client/dialers_generic.go
-@@ -5,7 +5,6 @@ package client
+@@ -3,9 +3,7 @@
+ package client
+ 
  import (
- 	"github.com/netbirdio/netbird/client/iface"
+-	"github.com/netbirdio/netbird/client/iface"
  	"github.com/netbirdio/netbird/shared/relay/client/dialer"
 -	"github.com/netbirdio/netbird/shared/relay/client/dialer/quic"
  	"github.com/netbirdio/netbird/shared/relay/client/dialer/ws"
  )
  
-@@ -34,12 +33,12 @@ func (c *Client) baseDialers(mode TransportMode) []dialer.DialeFn {
- 		return []dialer.DialeFn{ws.Dialer{}}
- 	case TransportModeQUIC:
- 		c.log.Infof("%s=quic, using QUIC transport", EnvRelayTransport)
+@@ -28,23 +26,10 @@ func (c *Client) getDialers(mode TransportMode) []dialer.DialeFn {
+ // fallback filtering. For racing modes (auto) the order is irrelevant; for
+ // prefer modes the first entry is tried before falling back to the second.
+ func (c *Client) baseDialers(mode TransportMode) []dialer.DialeFn {
+-	switch mode {
+-	case TransportModeWS:
+-		c.log.Infof("%s=ws, using WebSocket transport", EnvRelayTransport)
+-		return []dialer.DialeFn{ws.Dialer{}}
+-	case TransportModeQUIC:
+-		c.log.Infof("%s=quic, using QUIC transport", EnvRelayTransport)
 -		return []dialer.DialeFn{quic.Dialer{}}
-+		return []dialer.DialeFn{ws.Dialer{}}
- 	}
- 
+-	}
+-
 -	all := []dialer.DialeFn{quic.Dialer{}, ws.Dialer{}}
-+	all := []dialer.DialeFn{ws.Dialer{}, ws.Dialer{}}
- 	if mode == TransportModePreferWS {
+-	if mode == TransportModePreferWS {
 -		all = []dialer.DialeFn{ws.Dialer{}, quic.Dialer{}}
-+		all = []dialer.DialeFn{ws.Dialer{}, ws.Dialer{}}
- 	}
- 
- 	if c.mtu > 0 && c.mtu > iface.DefaultMTU {
+-	}
+-
+-	if c.mtu > 0 && c.mtu > iface.DefaultMTU {
+-		c.log.Infof("MTU %d exceeds default (%d), avoiding datagram-sized transports", c.mtu, iface.DefaultMTU)
+-		return nonDatagramSized(all)
+-	}
+-	return all
++	// IP-KVM 裁剪：relay 只保留 WebSocket（TCP）传输，去掉 QUIC。
++	// 代价是没有 QUIC 的多路复用/抗丢包；收益是甩掉整个 quic-go
++	// （约 1 MB flash + 若干 MB 堆）。relay 走 ws 已实测可连通。
++	_ = mode
++	c.log.Infof("using WebSocket transport for relay (QUIC trimmed)")
++	return []dialer.DialeFn{ws.Dialer{}}
+ }

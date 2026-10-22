@@ -1,7 +1,7 @@
 #
 # NetBird (client) ARMv7 Cross-Compilation Makefile
 # Target Platform: RV1106 (arm-rockchip830-linux-uclibcgnueabihf)
-# Tag: v0.79.0
+# Tag: v0.81.3
 #
 # netbird 客户端是纯 Go：CGO_ENABLED=0 编出来是完全静态的，不依赖目标机 libc
 # 版本，所以在 uClibc 根文件系统上直接能跑（client/ 里唯一的 import "C" 在
@@ -28,8 +28,8 @@ OUTPUT_DIR := $(PKG_BIN)
 CURRENT_DIR := $(shell pwd)
 
 # netbird version（注入到二进制里，见 version 包）
-NETBIRD_TAG := v0.79.0
-NETBIRD_VERSION := 0.79.0
+NETBIRD_TAG := v0.81.3
+NETBIRD_VERSION := 0.81.3
 NETBIRD_SRC := $(CURDIR)/netbird
 
 # Number of parallel jobs

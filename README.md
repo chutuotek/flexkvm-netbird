@@ -4,7 +4,7 @@ NetBird 客户端 ARMv7 交叉编译（RV1106 / uClibc 根文件系统）。
 
 ## 版本
 
-- NetBird: **v0.79.0**（上游 tag，纯 Go）
+- NetBird: **v0.81.3**（上游 tag，纯 Go）
 - 目标: `GOOS=linux GOARCH=arm GOARM=7`，**CGO_ENABLED=0 → 完全静态**，
   不依赖目标机 libc 版本，uClibc 直接能跑
 - Go: 需要 `go >= 1.26`（go.mod 要求 1.26.0；用 `GOTOOLCHAIN=local` 禁止自动下载工具链）
@@ -91,7 +91,7 @@ out/
 [GHSA-qcpp-8vwj-hhwr](https://netbird.io/knowledge-hub/security-advisory-daemon-ipc-local-privilege-escalation)：
 客户端守护进程 IPC **接受任意本地进程的无认证控制命令**，本地非特权用户可读配置、
 改安全设置、断开 VPN、把节点挪到别的账号并借此提权。
-影响 v0.5.0（2022-03）至 v0.75.1，**v0.76.0 修复**（本仓库的 v0.79.0 已包含修复）。
+影响 v0.5.0（2022-03）至 v0.75.1，**v0.76.0 修复**（本仓库的 v0.81.3 已包含修复）。
 
 但要注意：**本地 socket 默认是 `0666`**。集成时如果把它放在多用户可写的目录里，
 等于把控制权交给任何能跑进程的东西——建议收紧到 `0600` 并放在 `0700` 目录下。
@@ -100,7 +100,7 @@ out/
 
 - 目标平台: RV1106 (arm-rockchip830-linux-uclibcgnueabihf)
 - Go: `CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 GOTOOLCHAIN=local`
-- 链接参数: `-ldflags="-s -w -buildid= -X github.com/netbirdio/netbird/version.version=0.79.0"
+- 链接参数: `-ldflags="-s -w -buildid= -X github.com/netbirdio/netbird/version.version=0.81.3"
   -trimpath -buildvcs=false -gcflags='all=-l'`
   > `-gcflags` 必须带 `all=` 前缀，否则只作用于 `./client` 本身、不含依赖包，等于无效。
-  > `-buildvcs=false` 让二进制版本固定输出 `0.79.0`（否则会带上 `-dirty` 后缀）。
+  > `-buildvcs=false` 让二进制版本固定输出 `0.81.3`（否则会带上 `-dirty` 后缀）。

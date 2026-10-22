@@ -1,6 +1,6 @@
 diff --git a/client/cmd/capture.go b/client/cmd/capture.go
 deleted file mode 100644
-index 95caaa5..0000000
+index 95caaa5cd..000000000
 --- a/client/cmd/capture.go
 +++ /dev/null
 @@ -1,196 +0,0 @@
@@ -202,10 +202,10 @@ index 95caaa5..0000000
 -}
 diff --git a/client/cmd/debug.go b/client/cmd/debug.go
 deleted file mode 100644
-index 98fe536..0000000
+index c4d5ad6d7..000000000
 --- a/client/cmd/debug.go
 +++ /dev/null
-@@ -1,549 +0,0 @@
+@@ -1,581 +0,0 @@
 -package cmd
 -
 -import (
@@ -231,7 +231,10 @@ index 98fe536..0000000
 -	"github.com/netbirdio/netbird/version"
 -)
 -
--const errCloseConnection = "Failed to close connection: %v"
+-const (
+-	errCloseConnection = "Failed to close connection: %v"
+-	noUpDownFlag       = "no-updown"
+-)
 -
 -var (
 -	logFileCount             uint32
@@ -465,13 +468,14 @@ index 98fe536..0000000
 -	}
 -
 -	stateWasDown := stat.Status != string(internal.StatusConnected) && stat.Status != string(internal.StatusConnecting)
+-	noUpDown, _ := cmd.Flags().GetBool(noUpDownFlag)
 -
 -	initialLogLevel, err := client.GetLogLevel(cmd.Context(), &proto.GetLogLevelRequest{})
 -	if err != nil {
 -		return fmt.Errorf("failed to get log level: %v", status.Convert(err).Message())
 -	}
 -
--	if stateWasDown {
+-	if stateWasDown && !noUpDown {
 -		if _, err := client.Up(cmd.Context(), &proto.UpRequest{}); err != nil {
 -			cmd.PrintErrf("Failed to bring service up: %v\n", status.Convert(err).Message())
 -		} else {
@@ -492,34 +496,20 @@ index 98fe536..0000000
 -	}
 -
 -	needsRestoreUp := false
--	if _, err := client.Down(cmd.Context(), &proto.DownRequest{}); err != nil {
--		cmd.PrintErrf("Failed to bring service down: %v\n", status.Convert(err).Message())
+-	if noUpDown {
+-		enableSyncResponsePersistence(cmd, client)
 -	} else {
--		needsRestoreUp = !stateWasDown
--		cmd.Println("netbird down")
+-		needsRestoreUp = restartDaemon(cmd, client, stateWasDown)
 -	}
--
--	time.Sleep(1 * time.Second)
--
--	// Enable sync response persistence before bringing the service up
--	if _, err := client.SetSyncResponsePersistence(cmd.Context(), &proto.SetSyncResponsePersistenceRequest{
--		Enabled: true,
--	}); err != nil {
--		cmd.PrintErrf("Failed to enable sync response persistence: %v\n", status.Convert(err).Message())
--	}
--
--	if _, err := client.Up(cmd.Context(), &proto.UpRequest{}); err != nil {
--		cmd.PrintErrf("Failed to bring service up: %v\n", status.Convert(err).Message())
--	} else {
--		needsRestoreUp = false
--		cmd.Println("netbird up")
--	}
--
--	time.Sleep(3 * time.Second)
 -
 -	cpuProfilingStarted := false
 -	if _, err := client.StartCPUProfile(cmd.Context(), &proto.StartCPUProfileRequest{}); err != nil {
--		cmd.PrintErrf("Failed to start CPU profiling: %v\n", err)
+-		if msg := status.Convert(err).Message(); strings.Contains(msg, "already in progress") {
+-			cmd.PrintErrln("CPU profiling is already running (started with `netbird debug cpu start`). " +
+-				"It is left running and is included in a bundle created after `netbird debug cpu stop`.")
+-		} else {
+-			cmd.PrintErrf("Failed to start CPU profiling: %v\n", msg)
+-		}
 -	} else {
 -		cpuProfilingStarted = true
 -		defer func() {
@@ -609,7 +599,7 @@ index 98fe536..0000000
 -		}
 -	}
 -
--	if stateWasDown {
+-	if stateWasDown && !noUpDown {
 -		if _, err := client.Down(cmd.Context(), &proto.DownRequest{}); err != nil {
 -			cmd.PrintErrf("Failed to restore service down state: %v\n", status.Convert(err).Message())
 -		} else {
@@ -664,6 +654,47 @@ index 98fe536..0000000
 -
 -	cmd.Printf("Sync response persistence set to: %s\n", persistence)
 -	return nil
+-}
+-
+-// enableSyncResponsePersistence asks the daemon to keep the latest sync
+-// response so the bundle carries the network map. With a running daemon only
+-// syncs received after the call are kept.
+-func enableSyncResponsePersistence(cmd *cobra.Command, client proto.DaemonServiceClient) {
+-	if _, err := client.SetSyncResponsePersistence(cmd.Context(), &proto.SetSyncResponsePersistenceRequest{
+-		Enabled: true,
+-	}); err != nil {
+-		cmd.PrintErrf("Failed to enable sync response persistence: %v\n", status.Convert(err).Message())
+-	}
+-}
+-
+-// restartDaemon cycles the daemon down and up with sync response persistence
+-// enabled so the bundle carries the network map. It reports whether the
+-// daemon was left down although it was running before, so the caller can
+-// bring it back up.
+-func restartDaemon(cmd *cobra.Command, client proto.DaemonServiceClient, stateWasDown bool) bool {
+-	needsRestoreUp := false
+-	if _, err := client.Down(cmd.Context(), &proto.DownRequest{}); err != nil {
+-		cmd.PrintErrf("Failed to bring service down: %v\n", status.Convert(err).Message())
+-	} else {
+-		needsRestoreUp = !stateWasDown
+-		cmd.Println("netbird down")
+-	}
+-
+-	time.Sleep(1 * time.Second)
+-
+-	// Enable sync response persistence before bringing the service up
+-	enableSyncResponsePersistence(cmd, client)
+-
+-	if _, err := client.Up(cmd.Context(), &proto.UpRequest{}); err != nil {
+-		cmd.PrintErrf("Failed to bring service up: %v\n", status.Convert(err).Message())
+-	} else {
+-		needsRestoreUp = false
+-		cmd.Println("netbird up")
+-	}
+-
+-	time.Sleep(3 * time.Second)
+-
+-	return needsRestoreUp
 -}
 -
 -func waitForDurationOrCancel(ctx context.Context, duration time.Duration, cmd *cobra.Command) error {
@@ -754,10 +785,100 @@ index 98fe536..0000000
 -	forCmd.Flags().StringVar(&uploadBundleURLFlag, "upload-bundle-url", types.DefaultBundleURL, "Service URL to get an URL to upload the debug bundle")
 -	forCmd.Flags().BoolVar(&uploadBundleInsecureFlag, "upload-bundle-insecure", false, "Allow uploading to an http or untrusted-TLS upload server (self-hosted); requires root")
 -	forCmd.Flags().Bool("capture", false, "Capture packets during the debug duration and include in bundle")
+-	forCmd.Flags().Bool(noUpDownFlag, false, "Keep the daemon running instead of bringing it down and up before collecting. The bundle only includes the network map if a sync arrives during the run")
+-}
+diff --git a/client/cmd/debug_cpu.go b/client/cmd/debug_cpu.go
+deleted file mode 100644
+index a01b845cf..000000000
+--- a/client/cmd/debug_cpu.go
++++ /dev/null
+@@ -1,83 +0,0 @@
+-package cmd
+-
+-import (
+-	"fmt"
+-
+-	log "github.com/sirupsen/logrus"
+-	"github.com/spf13/cobra"
+-	"google.golang.org/grpc/status"
+-
+-	"github.com/netbirdio/netbird/client/proto"
+-)
+-
+-var debugCPUCmd = &cobra.Command{
+-	Use:   "cpu",
+-	Short: "Profile the daemon's CPU usage",
+-	Long: `Starts and stops CPU profiling in the running daemon without restarting it.
+-The profile is included in the next debug bundle as cpu.prof.
+-
+-Profiling is not time limited: it keeps running, and keeps costing CPU, until
+-"netbird debug cpu stop" is run.`,
+-}
+-
+-var debugCPUStartCmd = &cobra.Command{
+-	Use:     "start",
+-	Short:   "Start CPU profiling in the daemon",
+-	Example: "  netbird debug cpu start",
+-	Args:    cobra.NoArgs,
+-	RunE:    debugCPUStart,
+-}
+-
+-var debugCPUStopCmd = &cobra.Command{
+-	Use:   "stop",
+-	Short: "Stop CPU profiling in the daemon",
+-	Long: `Stops CPU profiling. The captured profile stays in the daemon until the next
+-debug bundle is created, which includes it as cpu.prof.`,
+-	Example: "  netbird debug cpu stop && netbird debug bundle",
+-	Args:    cobra.NoArgs,
+-	RunE:    debugCPUStop,
+-}
+-
+-func debugCPUStart(cmd *cobra.Command, _ []string) error {
+-	conn, err := getClient(cmd)
+-	if err != nil {
+-		return err
+-	}
+-	defer func() {
+-		if err := conn.Close(); err != nil {
+-			log.Errorf(errCloseConnection, err)
+-		}
+-	}()
+-
+-	if _, err := proto.NewDaemonServiceClient(conn).StartCPUProfile(cmd.Context(), &proto.StartCPUProfileRequest{}); err != nil {
+-		return fmt.Errorf("start CPU profiling: %v", status.Convert(err).Message())
+-	}
+-
+-	cmd.Println("CPU profiling started and runs until stopped. Run `netbird debug cpu stop` and then `netbird debug bundle` to collect it.")
+-	return nil
+-}
+-
+-func debugCPUStop(cmd *cobra.Command, _ []string) error {
+-	conn, err := getClient(cmd)
+-	if err != nil {
+-		return err
+-	}
+-	defer func() {
+-		if err := conn.Close(); err != nil {
+-			log.Errorf(errCloseConnection, err)
+-		}
+-	}()
+-
+-	if _, err := proto.NewDaemonServiceClient(conn).StopCPUProfile(cmd.Context(), &proto.StopCPUProfileRequest{}); err != nil {
+-		return fmt.Errorf("stop CPU profiling: %v", status.Convert(err).Message())
+-	}
+-
+-	cmd.Println("CPU profiling stopped. Run `netbird debug bundle` to include cpu.prof.")
+-	return nil
+-}
+-
+-func init() {
+-	debugCPUCmd.AddCommand(debugCPUStartCmd)
+-	debugCPUCmd.AddCommand(debugCPUStopCmd)
+-	debugCmd.AddCommand(debugCPUCmd)
 -}
 diff --git a/client/cmd/debug_js.go b/client/cmd/debug_js.go
 deleted file mode 100644
-index d06fb8e..0000000
+index d06fb8efc..000000000
 --- a/client/cmd/debug_js.go
 +++ /dev/null
 @@ -1,8 +0,0 @@
@@ -771,7 +892,7 @@ index d06fb8e..0000000
 -}
 diff --git a/client/cmd/debug_unix.go b/client/cmd/debug_unix.go
 deleted file mode 100644
-index 5006500..0000000
+index 50065002e..000000000
 --- a/client/cmd/debug_unix.go
 +++ /dev/null
 @@ -1,40 +0,0 @@
@@ -817,7 +938,7 @@ index 5006500..0000000
 -}
 diff --git a/client/cmd/debug_windows.go b/client/cmd/debug_windows.go
 deleted file mode 100644
-index f3017b4..0000000
+index f3017b47b..000000000
 --- a/client/cmd/debug_windows.go
 +++ /dev/null
 @@ -1,127 +0,0 @@
@@ -950,7 +1071,7 @@ index f3017b4..0000000
 -}
 diff --git a/client/cmd/expose.go b/client/cmd/expose.go
 deleted file mode 100644
-index c48a6ad..0000000
+index c48a6adac..000000000
 --- a/client/cmd/expose.go
 +++ /dev/null
 @@ -1,287 +0,0 @@
@@ -1241,113 +1362,49 @@ index c48a6ad..0000000
 -		}
 -	}
 -}
-diff --git a/client/cmd/forwarding_rules.go b/client/cmd/forwarding_rules.go
+diff --git a/client/cmd/jobs.go b/client/cmd/jobs.go
 deleted file mode 100644
-index b305274..0000000
---- a/client/cmd/forwarding_rules.go
+index 36aab3570..000000000
+--- a/client/cmd/jobs.go
 +++ /dev/null
-@@ -1,98 +0,0 @@
+@@ -1,13 +0,0 @@
 -package cmd
 -
--import (
--	"fmt"
--	"sort"
+-// remoteJobsAllowedFlag opts this peer into running remote jobs (e.g. debug
+-// bundles) requested by the management server. It defaults to false: remote
+-// jobs are an explicit opt-in, and enabling it is a privileged change (see the
+-// daemon gate in client/server), mirroring the SSH server opt-in.
+-const remoteJobsAllowedFlag = "allow-remote-jobs"
 -
--	"github.com/spf13/cobra"
--	"google.golang.org/grpc/status"
+-var remoteJobsAllowed bool
 -
--	"github.com/netbirdio/netbird/client/proto"
--)
--
--var forwardingRulesCmd = &cobra.Command{
--	Use:   "forwarding",
--	Short: "List forwarding rules",
--	Long:  `Commands to list forwarding rules.`,
+-func init() {
+-	upCmd.PersistentFlags().BoolVar(&remoteJobsAllowed, remoteJobsAllowedFlag, false, "Allow the management server to run remote jobs (e.g. debug bundles) on this peer")
 -}
--
--var forwardingRulesListCmd = &cobra.Command{
--	Use:     "list",
--	Aliases: []string{"ls"},
--	Short:   "List forwarding rules",
--	Example: "  netbird forwarding list",
--	Long:    "Commands to list forwarding rules.",
--	RunE:    listForwardingRules,
--}
--
--func listForwardingRules(cmd *cobra.Command, _ []string) error {
--	conn, err := getClient(cmd)
--	if err != nil {
--		return err
--	}
--	defer conn.Close()
--
--	client := proto.NewDaemonServiceClient(conn)
--	resp, err := client.ForwardingRules(cmd.Context(), &proto.EmptyRequest{})
--	if err != nil {
--		return fmt.Errorf("failed to list network: %v", status.Convert(err).Message())
--	}
--
--	if len(resp.GetRules()) == 0 {
--		cmd.Println("No forwarding rules available.")
--		return nil
--	}
--
--	printForwardingRules(cmd, resp.GetRules())
--	return nil
--}
--
--func printForwardingRules(cmd *cobra.Command, rules []*proto.ForwardingRule) {
--	cmd.Println("Available forwarding rules:")
--
--	// Sort rules by translated address
--	sort.Slice(rules, func(i, j int) bool {
--		if rules[i].GetTranslatedAddress() != rules[j].GetTranslatedAddress() {
--			return rules[i].GetTranslatedAddress() < rules[j].GetTranslatedAddress()
--		}
--		if rules[i].GetProtocol() != rules[j].GetProtocol() {
--			return rules[i].GetProtocol() < rules[j].GetProtocol()
--		}
--
--		return getFirstPort(rules[i].GetDestinationPort()) < getFirstPort(rules[j].GetDestinationPort())
--	})
--
--	var lastIP string
--	for _, rule := range rules {
--		dPort := portToString(rule.GetDestinationPort())
--		tPort := portToString(rule.GetTranslatedPort())
--		if lastIP != rule.GetTranslatedAddress() {
--			lastIP = rule.GetTranslatedAddress()
--			cmd.Printf("\nTranslated peer: %s\n", rule.GetTranslatedHostname())
--		}
--
--		cmd.Printf("  Local %s/%s to %s:%s\n", rule.GetProtocol(), dPort, rule.GetTranslatedAddress(), tPort)
--	}
--}
--
--func getFirstPort(portInfo *proto.PortInfo) int {
--	switch v := portInfo.PortSelection.(type) {
--	case *proto.PortInfo_Port:
--		return int(v.Port)
--	case *proto.PortInfo_Range_:
--		return int(v.Range.GetStart())
--	default:
--		return 0
--	}
--}
--
--func portToString(translatedPort *proto.PortInfo) string {
--	switch v := translatedPort.PortSelection.(type) {
--	case *proto.PortInfo_Port:
--		return fmt.Sprintf("%d", v.Port)
--	case *proto.PortInfo_Range_:
--		return fmt.Sprintf("%d-%d", v.Range.GetStart(), v.Range.GetEnd())
--	default:
--		return "No port specified"
--	}
--}
+diff --git a/client/cmd/jobs_flags.go b/client/cmd/jobs_flags.go
+new file mode 100644
+index 000000000..c3da978f6
+--- /dev/null
++++ b/client/cmd/jobs_flags.go
+@@ -0,0 +1,15 @@
++// IP-KVM：这是 jobs.go 里唯一被 up.go / login.go 引用的部分。
++// jobs.go 的命令注册（`netbird jobs`）随裁剪移除，但
++// --allow-remote-jobs 这个开关仍要保留：它控制"是否允许管理端在本节点
++// 执行远程任务（如收集 debug bundle）"，属安全开关，删掉会让参数解析失败。
++package cmd
++
++// remoteJobsAllowedFlag opts this peer into running remote jobs (e.g. debug
++// bundles) triggered by the management server.
++const remoteJobsAllowedFlag = "allow-remote-jobs"
++
++var remoteJobsAllowed bool
++
++func init() {
++	upCmd.PersistentFlags().BoolVar(&remoteJobsAllowed, remoteJobsAllowedFlag, false, "Allow the management server to run remote jobs (e.g. debug bundles) on this peer")
++}
 diff --git a/client/cmd/kubernetes.go b/client/cmd/kubernetes.go
 deleted file mode 100644
-index cc91477..0000000
+index cc91477c6..000000000
 --- a/client/cmd/kubernetes.go
 +++ /dev/null
 @@ -1,301 +0,0 @@
@@ -1652,9 +1709,167 @@ index cc91477..0000000
 -	v[i] = add
 -	return v
 -}
+diff --git a/client/cmd/kubernetes_test.go b/client/cmd/kubernetes_test.go
+deleted file mode 100644
+index c40d20996..000000000
+--- a/client/cmd/kubernetes_test.go
++++ /dev/null
+@@ -1,120 +0,0 @@
+-package cmd
+-
+-import (
+-	"net/http"
+-	"net/http/httptest"
+-	"net/url"
+-	"os"
+-	"path/filepath"
+-	"testing"
+-
+-	"github.com/spf13/cobra"
+-	"github.com/stretchr/testify/require"
+-)
+-
+-func TestFingerprintClusters(t *testing.T) {
+-	t.Parallel()
+-
+-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		//nolint: errcheck
+-		w.Write([]byte(`{"gitVersion": "foobar"}`))
+-	}))
+-	defer srv.Close()
+-
+-	clusterURL, clusterVersion, err := fingerprintClusters(t.Context(), srv.Client(), srv.Listener.Addr().String())
+-	require.NoError(t, err)
+-	require.Equal(t, srv.URL, clusterURL.String())
+-	require.Equal(t, "foobar", clusterVersion)
+-}
+-
+-func TestResolveKubeconfigPath(t *testing.T) {
+-	home, err := os.UserHomeDir()
+-	if err != nil {
+-		t.Fatalf("could not determine home directory: %v", err)
+-	}
+-	defaultPath := filepath.Join(home, ".kube", "config")
+-	path, err := resolveKubeconfigPath(&cobra.Command{})
+-	require.NoError(t, err)
+-	require.Equal(t, defaultPath, path)
+-
+-	flagPath := "flag-path"
+-	cmd := &cobra.Command{}
+-	cmd.Flags().String("kubeconfig", "", "")
+-	err = cmd.Flags().Set("kubeconfig", flagPath)
+-	require.NoError(t, err)
+-	path, err = resolveKubeconfigPath(cmd)
+-	require.NoError(t, err)
+-	require.Equal(t, flagPath, path)
+-
+-	envPath := "env-path"
+-	t.Setenv("KUBECONFIG", envPath)
+-	path, err = resolveKubeconfigPath(&cobra.Command{})
+-	require.NoError(t, err)
+-	require.Equal(t, envPath, path)
+-}
+-
+-func TestWriteKubeconfig(t *testing.T) {
+-	t.Parallel()
+-
+-	tests := []struct {
+-		name     string
+-		existing string
+-	}{
+-		{
+-			name: "empty file",
+-		},
+-		{
+-			name: "existing content",
+-			existing: `apiVersion: v1
+-clusters:
+-- cluster:
+-    insecure-skip-tls-verify: true
+-    server: https://foobar.com
+-  name: foo
+-current-context: test
+-kind: Config
+-users: []
+-`,
+-		},
+-	}
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			t.Parallel()
+-
+-			kubeconfigPath := filepath.Join(t.TempDir(), "config")
+-			err := os.WriteFile(kubeconfigPath, []byte(tt.existing), 0o644)
+-			require.NoError(t, err)
+-
+-			kc := kubernetesCluster{
+-				name: "foo",
+-				url:  &url.URL{Scheme: "https", Host: "example.com"},
+-			}
+-			err = writeKubeconfig(kubeconfigPath, kc)
+-			require.NoError(t, err)
+-
+-			b, err := os.ReadFile(kubeconfigPath)
+-			require.NoError(t, err)
+-			expected := `apiVersion: v1
+-clusters:
+-- cluster:
+-    insecure-skip-tls-verify: true
+-    server: https://example.com
+-  name: foo
+-contexts:
+-- context:
+-    cluster: foo
+-    namespace: default
+-    user: netbird
+-  name: foo
+-current-context: foo
+-kind: Config
+-users:
+-- name: netbird
+-  user:
+-    token: none
+-`
+-			require.Equal(t, expected, string(b))
+-		})
+-	}
+-
+-}
+diff --git a/client/cmd/login.go b/client/cmd/login.go
+index 764fdd5b1..10b999764 100644
+--- a/client/cmd/login.go
++++ b/client/cmd/login.go
+@@ -3,12 +3,10 @@ package cmd
+ import (
+ 	"context"
+ 	"fmt"
+-	"os"
+ 	"strings"
+ 
+ 	log "github.com/sirupsen/logrus"
+ 	"github.com/spf13/cobra"
+-	"golang.org/x/term"
+ 
+ 	"github.com/netbirdio/netbird/client/internal"
+ 	"github.com/netbirdio/netbird/client/internal/auth"
+@@ -492,11 +490,9 @@ func openURL(cmd *cobra.Command, verificationURIComplete, userCode string, noBro
+ 			verificationURIComplete + " " + codeMsg)
+ 	}
+ 
+-	if showQR {
+-		if f, ok := cmd.OutOrStdout().(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+-			printQRCode(f, verificationURIComplete)
+-		}
+-	}
++	// IP-KVM：showQR 的终端二维码渲染依赖 qr.go，已在裁剪中移除。
++	// SSO 链接仍会打印在上面，功能不受影响。
++	_ = showQR
+ 
+ 	cmd.Println("")
+ 
 diff --git a/client/cmd/networks.go b/client/cmd/networks.go
 deleted file mode 100644
-index 05823b8..0000000
+index 05823b8bb..000000000
 --- a/client/cmd/networks.go
 +++ /dev/null
 @@ -1,173 +0,0 @@
@@ -1831,374 +2046,162 @@ index 05823b8..0000000
 -
 -	return nil
 -}
-diff --git a/client/cmd/profile.go b/client/cmd/profile.go
+diff --git a/client/cmd/posture.go b/client/cmd/posture.go
 deleted file mode 100644
-index 2d66535..0000000
---- a/client/cmd/profile.go
+index b0870233d..000000000
+--- a/client/cmd/posture.go
 +++ /dev/null
-@@ -1,343 +0,0 @@
+@@ -1,30 +0,0 @@
 -package cmd
 -
 -import (
--	"context"
--	"errors"
--	"fmt"
--	"strings"
--	"text/tabwriter"
--	"time"
--
 -	"github.com/spf13/cobra"
--	"google.golang.org/grpc/codes"
--	gstatus "google.golang.org/grpc/status"
 -
--	"github.com/netbirdio/netbird/client/internal"
--	"github.com/netbirdio/netbird/client/internal/profilemanager"
--	"github.com/netbirdio/netbird/client/proto"
--	"github.com/netbirdio/netbird/util"
+-	log "github.com/sirupsen/logrus"
+-
+-	"github.com/netbirdio/netbird/client/internal/certproof"
 -)
 -
--var profileListShowID bool
--
--var profileCmd = &cobra.Command{
--	Use:   "profile",
--	Short: "Manage NetBird client profiles",
--	Long:  `Commands to list, add, remove, and switch profiles. Profiles allow you to maintain different accounts in one client app.`,
+-var postureCmd = &cobra.Command{
+-	Use:    "posture",
+-	Short:  "Posture helpers invoked by the NetBird daemon",
+-	Hidden: true,
 -}
 -
--var profileListCmd = &cobra.Command{
--	Use:     "list",
--	Short:   "List all profiles",
--	Long:    `List all available profiles in the NetBird client.`,
--	Aliases: []string{"ls"},
--	RunE:    listProfilesFunc,
+-var postureCertProofCmd = &cobra.Command{
+-	Use:   "cert-proof",
+-	Short: "Answer certificate posture challenges from the calling user's keychain",
+-	Long: "Reads a certificate challenge set as JSON on stdin and writes the proofs as JSON on stdout.\n" +
+-		"The daemon launches this in the console user's desktop session, because a login keychain\n" +
+-		"cannot be reached from a root daemon. Not intended to be run by hand.",
+-	Hidden:       true,
+-	SilenceUsage: true,
+-	RunE: func(cmd *cobra.Command, args []string) error {
+-		// Proofs travel on stdout, so every log line has to go elsewhere.
+-		log.SetOutput(cmd.ErrOrStderr())
+-		return certproof.RunHelper(cmd.Context(), cmd.InOrStdin(), cmd.OutOrStdout())
+-	},
 -}
+diff --git a/client/cmd/pprof.go b/client/cmd/pprof.go
+deleted file mode 100644
+index c041c6ea9..000000000
+--- a/client/cmd/pprof.go
++++ /dev/null
+@@ -1,32 +0,0 @@
+-//go:build pprof
 -
--var profileAddCmd = &cobra.Command{
--	Use:   "add <profile_name>",
--	Short: "Add a new profile",
--	Long:  `Add a new profile. Profile name is free-form, a unique ID is generated for the on-disk config file.`,
--	Args:  cobra.ExactArgs(1),
--	RunE:  addProfileFunc,
--}
+-package cmd
 -
--var profileRenameCmd = &cobra.Command{
--	Use:   "rename <profile> <new_profile_name>",
--	Short: "Renames an existing profile",
--	Long:  `Renames an existing profile (by a name, ID, or unique ID prefix). Profile name is free-form.`,
--	Args:  cobra.ExactArgs(2),
--	RunE:  renameProfileFunc,
--}
+-import (
+-	"net/http"
+-	_ "net/http/pprof"
+-	"os"
 -
--var profileRemoveCmd = &cobra.Command{
--	Use:     "remove <profile>",
--	Short:   "Remove a profile",
--	Long:    `Remove a profile by name, ID, or unique ID prefix.`,
--	Aliases: []string{"rm"},
--	Args:    cobra.ExactArgs(1),
--	RunE:    removeProfileFunc,
--}
--
--var profileSelectCmd = &cobra.Command{
--	Use:   "select <profile>",
--	Short: "Select a profile",
--	Long:  `Make the specified profile active. Accepts a name, ID, or unique ID prefix.`,
--	Args:  cobra.ExactArgs(1),
--	RunE:  selectProfileFunc,
--}
+-	log "github.com/sirupsen/logrus"
+-)
 -
 -func init() {
--	profileListCmd.Flags().BoolVar(&profileListShowID, "show-id", false, "show the profile ID column")
+-	addr := pprofAddr()
+-	go pprof(addr)
 -}
 -
--func setupCmd(cmd *cobra.Command) error {
--	SetFlagsFromEnvVars(rootCmd)
--	SetFlagsFromEnvVars(cmd)
--
--	cmd.SetOut(cmd.OutOrStdout())
--
--	err := util.InitLog(logLevel, "console")
--	if err != nil {
--		return err
+-func pprofAddr() string {
+-	listenAddr := os.Getenv("NB_PPROF_ADDR")
+-	if listenAddr == "" {
+-		return "localhost:6969"
 -	}
 -
--	return nil
+-	return listenAddr
 -}
 -
--func listProfilesFunc(cmd *cobra.Command, _ []string) error {
--	if err := setupCmd(cmd); err != nil {
--		return err
+-func pprof(listenAddr string) {
+-	log.Infof("listening pprof on: %s\n", listenAddr)
+-	if err := http.ListenAndServe(listenAddr, nil); err != nil {
+-		log.Fatalf("Failed to start pprof: %v", err)
 -	}
+-}
+diff --git a/client/cmd/qr.go b/client/cmd/qr.go
+deleted file mode 100644
+index 8b2c489ff..000000000
+--- a/client/cmd/qr.go
++++ /dev/null
+@@ -1,25 +0,0 @@
+-package cmd
 -
--	conn, err := DialClientGRPCServer(cmd.Context(), daemonAddr)
--	if err != nil {
--		return fmt.Errorf("connect to service CLI interface: %w", err)
+-import (
+-	"io"
+-
+-	"github.com/mdp/qrterminal/v3"
+-)
+-
+-// printQRCode prints a QR code for the given URL to the writer.
+-// Called only when the user explicitly requests QR output via --qr.
+-func printQRCode(w io.Writer, url string) {
+-	if url == "" {
+-		return
 -	}
--	defer conn.Close()
--
--	currUser, err := profilemanager.InvokingUser()
--	if err != nil {
--		return fmt.Errorf("get current user: %w", err)
--	}
--
--	daemonClient := proto.NewDaemonServiceClient(conn)
--
--	resp, err := daemonClient.ListProfiles(cmd.Context(), &proto.ListProfilesRequest{
--		Username: currUser.Username,
+-	qrterminal.GenerateWithConfig(url, qrterminal.Config{
+-		Level:          qrterminal.M,
+-		Writer:         w,
+-		HalfBlocks:     true,
+-		BlackChar:      qrterminal.BLACK_BLACK,
+-		WhiteChar:      qrterminal.WHITE_WHITE,
+-		BlackWhiteChar: qrterminal.BLACK_WHITE,
+-		WhiteBlackChar: qrterminal.WHITE_BLACK,
+-		QuietZone:      qrterminal.QUIET_ZONE,
 -	})
--	if err != nil {
--		return err
--	}
+-}
+diff --git a/client/cmd/qr_test.go b/client/cmd/qr_test.go
+deleted file mode 100644
+index d12705b9e..000000000
+--- a/client/cmd/qr_test.go
++++ /dev/null
+@@ -1,26 +0,0 @@
+-package cmd
 -
--	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
--	if profileListShowID {
--		fmt.Fprintln(tw, "ID\tNAME\tACTIVE")
--	} else {
--		fmt.Fprintln(tw, "NAME\tACTIVE")
+-import (
+-	"bytes"
+-	"testing"
+-)
+-
+-func TestPrintQRCode_EmptyURL(t *testing.T) {
+-	var buf bytes.Buffer
+-
+-	printQRCode(&buf, "")
+-
+-	if buf.Len() != 0 {
+-		t.Error("expected no output for empty URL")
 -	}
--	for _, profile := range resp.Profiles {
--		marker := ""
--		if profile.IsActive {
--			marker = "✓"
--		}
--		name := profilemanager.StripCtrlChars(profile.Name)
--		id := profilemanager.ID(profile.Id)
--		if profileListShowID {
--			fmt.Fprintf(tw, "%s\t%s\t%s\n", id.ShortID(), name, marker)
--		} else {
--			fmt.Fprintf(tw, "%s\t%s\n", name, marker)
--		}
--	}
--	return tw.Flush()
 -}
 -
--func addProfileFunc(cmd *cobra.Command, args []string) error {
--	if err := setupCmd(cmd); err != nil {
--		return err
+-func TestPrintQRCode_WritesOutput(t *testing.T) {
+-	var buf bytes.Buffer
+-
+-	printQRCode(&buf, "https://example.com/auth")
+-
+-	if buf.Len() == 0 {
+-		t.Error("expected QR code output for non-empty URL")
 -	}
--
--	currUser, err := profilemanager.InvokingUser()
--	if err != nil {
--		return fmt.Errorf("get current user: %w", err)
--	}
--
--	conn, err := DialClientGRPCServer(cmd.Context(), daemonAddr)
--	if err != nil {
--		return fmt.Errorf("connect to service CLI interface: %w", err)
--	}
--	defer conn.Close()
--
--	daemonClient := proto.NewDaemonServiceClient(conn)
--	profileName := args[0]
--
--	id, err := addProfileOnDaemon(cmd.Context(), daemonClient, profileName, currUser.Username)
--	if err != nil {
--		return err
--	}
--
--	dupCount, _ := countProfilesWithName(cmd.Context(), daemonClient, currUser.Username, profileName)
--	if dupCount > 1 {
--		cmd.Printf("Warning: %d other profile(s) already use the name %q.\n", dupCount-1, profileName)
--		cmd.Println("Use `netbird profile list --show-id` to disambiguate later.")
--	}
--
--	cmd.Printf("Profile added: %s  %s\n", id.ShortID(), profilemanager.StripCtrlChars(profileName))
--	return nil
--
--}
--
--func renameProfileFunc(cmd *cobra.Command, args []string) error {
--	if err := setupCmd(cmd); err != nil {
--		return err
--	}
--
--	conn, err := DialClientGRPCServer(cmd.Context(), daemonAddr)
--	if err != nil {
--		return fmt.Errorf("connect to service CLI interface: %w", err)
--	}
--	defer conn.Close()
--
--	currUser, err := profilemanager.InvokingUser()
--	if err != nil {
--		return fmt.Errorf("get current user: %w", err)
--	}
--
--	daemonClient := proto.NewDaemonServiceClient(conn)
--	handle := args[0]
--	newProfilename := args[1]
--
--	resp, err := daemonClient.RenameProfile(cmd.Context(), &proto.RenameProfileRequest{
--		Handle:         handle,
--		Username:       currUser.Username,
--		NewProfileName: newProfilename,
--	})
--	if err != nil {
--		return wrapAmbiguityError(err, handle)
--	}
--
--	dupCount, _ := countProfilesWithName(cmd.Context(), daemonClient, currUser.Username, newProfilename)
--	if dupCount > 1 {
--		cmd.Printf("Warning: %d other profile(s) already use the name %q.\n", dupCount-1, newProfilename)
--		cmd.Println("Use `netbird profile list --show-id` to disambiguate later.")
--	}
--
--	cmd.Printf("Profile renamed from %s to %s\n", profilemanager.StripCtrlChars(resp.OldProfileName), profilemanager.StripCtrlChars(newProfilename))
--
--	return nil
--}
--
--func countProfilesWithName(ctx context.Context, c proto.DaemonServiceClient, username, name string) (int, error) {
--	resp, err := c.ListProfiles(ctx, &proto.ListProfilesRequest{Username: username})
--	if err != nil {
--		return 0, err
--	}
--	n := 0
--	for _, p := range resp.Profiles {
--		if p.Name == name {
--			n++
--		}
--	}
--	return n, nil
--}
--
--func removeProfileFunc(cmd *cobra.Command, args []string) error {
--	if err := setupCmd(cmd); err != nil {
--		return err
--	}
--
--	conn, err := DialClientGRPCServer(cmd.Context(), daemonAddr)
--	if err != nil {
--		return fmt.Errorf("connect to service CLI interface: %w", err)
--	}
--	defer conn.Close()
--
--	currUser, err := profilemanager.InvokingUser()
--	if err != nil {
--		return fmt.Errorf("get current user: %w", err)
--	}
--
--	daemonClient := proto.NewDaemonServiceClient(conn)
--	handle := args[0]
--
--	resp, err := daemonClient.RemoveProfile(cmd.Context(), &proto.RemoveProfileRequest{
--		ProfileName: handle,
--		Username:    currUser.Username,
--	})
--	if err != nil {
--		return wrapAmbiguityError(err, handle)
--	}
--
--	cmd.Printf("Profile removed: %s\n", resp.Id)
--	return nil
--}
--
--func selectProfileFunc(cmd *cobra.Command, args []string) error {
--	if err := setupCmd(cmd); err != nil {
--		return err
--	}
--
--	profileManager := profilemanager.NewProfileManager()
--	handle := args[0]
--
--	currUser, err := profilemanager.InvokingUser()
--	if err != nil {
--		return fmt.Errorf("get current user: %w", err)
--	}
--
--	ctx, cancel := context.WithTimeout(context.Background(), time.Second*7)
--	defer cancel()
--	conn, err := DialClientGRPCServer(ctx, daemonAddr)
--	if err != nil {
--		return fmt.Errorf("connect to service CLI interface: %w", err)
--	}
--	defer conn.Close()
--
--	daemonClient := proto.NewDaemonServiceClient(conn)
--
--	switchResp, err := daemonClient.SwitchProfile(ctx, &proto.SwitchProfileRequest{
--		ProfileName: &handle,
--		Username:    &currUser.Username,
--	})
--	if err != nil {
--		return wrapAmbiguityError(err, handle)
--	}
--
--	if err := profileManager.SwitchProfile(profilemanager.ID(switchResp.Id)); err != nil {
--		return err
--	}
--
--	status, err := daemonClient.Status(ctx, &proto.StatusRequest{})
--	if err != nil {
--		return fmt.Errorf("get service status: %w", err)
--	}
--
--	if status.Status == string(internal.StatusConnected) {
--		if _, err := daemonClient.Down(ctx, &proto.DownRequest{}); err != nil {
--			return fmt.Errorf("call service down method: %w", err)
--		}
--	}
--
--	id := profilemanager.ID(switchResp.Id)
--	cmd.Printf("Profile switched to: %s\n", id.ShortID())
--	return nil
--}
--
--// wrapAmbiguityError turns the daemon's gRPC InvalidArgument errors
--// (which carry the resolver's message verbatim) into CLI-friendly text
--// that points the user at --show-id.
--func wrapAmbiguityError(err error, handle string) error {
--	if err == nil {
--		return nil
--	}
--	st, ok := gstatus.FromError(err)
--	if !ok {
--		return err
--	}
--	switch st.Code() {
--	case codes.InvalidArgument:
--		msg := st.Message()
--		if strings.Contains(msg, "ambiguous") {
--			return errors.New(msg + "\nRun `netbird profile list --show-id` to see IDs, then select by ID prefix:\n  netbird profile select|remove <id-prefix>")
--		}
--	case codes.NotFound:
--		return fmt.Errorf("profile %q not found", handle)
--	}
--	return err
--}
--
--// addProfileOnDaemon issues the AddProfile RPC on an existing daemon client
--// and returns the new profile's ID. It is the single entry point for profile
--// creation, shared by `netbird profile add` and the `netbird up --profile
--// <name>` auto-create path.
--func addProfileOnDaemon(ctx context.Context, client proto.DaemonServiceClient, profileName, username string) (profilemanager.ID, error) {
--	resp, err := client.AddProfile(ctx, &proto.AddProfileRequest{
--		ProfileName: profileName,
--		Username:    username,
--	})
--	if err != nil {
--		return "", fmt.Errorf("add profile failed: %w", err)
--	}
--
--	return profilemanager.ID(resp.Id), nil
 -}
 diff --git a/client/cmd/root.go b/client/cmd/root.go
-index be64794..425f6a7 100644
+index 51179f77c..d9d48fa14 100644
 --- a/client/cmd/root.go
 +++ b/client/cmd/root.go
-@@ -173,36 +173,6 @@ func init() {
+@@ -175,36 +175,6 @@ func init() {
  	rootCmd.AddCommand(loginCmd)
  	rootCmd.AddCommand(logoutCmd)
  	rootCmd.AddCommand(versionCmd)
 -	rootCmd.AddCommand(sshCmd)
 -	rootCmd.AddCommand(networksCMD)
--	rootCmd.AddCommand(forwardingRulesCmd)
 -	rootCmd.AddCommand(debugCmd)
 -	rootCmd.AddCommand(profileCmd)
 -	rootCmd.AddCommand(exposeCmd)
+-	rootCmd.AddCommand(postureCmd)
+-
+-	postureCmd.AddCommand(postureCertProofCmd)
 -
 -	networksCMD.AddCommand(routesListCmd)
 -	networksCMD.AddCommand(routesSelectCmd, routesDeselectCmd)
--
--	forwardingRulesCmd.AddCommand(forwardingRulesListCmd)
 -
 -	debugCmd.AddCommand(debugBundleCmd)
 -	debugCmd.AddCommand(logCmd)
@@ -2222,19 +2225,22 @@ index be64794..425f6a7 100644
  	upCmd.PersistentFlags().StringSliceVar(&natExternalIPs, externalIPMapFlag, nil,
  		`Sets external IPs maps between local addresses and interfaces.`+
 diff --git a/client/cmd/service.go b/client/cmd/service.go
-index 2a558e6..59cdc35 100644
+index 2a558e6d5..15975f346 100644
 --- a/client/cmd/service.go
 +++ b/client/cmd/service.go
-@@ -78,7 +78,7 @@ func init() {
+@@ -78,7 +78,10 @@ func init() {
  		defaultServiceName = "Netbird"
  	}
  
 -	serviceCmd.AddCommand(runCmd, startCmd, stopCmd, restartCmd, svcStatusCmd, installCmd, uninstallCmd, reconfigureCmd, resetParamsCmd)
-+	serviceCmd.AddCommand(runCmd, startCmd, stopCmd, restartCmd, svcStatusCmd, resetParamsCmd)
++	// IP-KVM：service install/uninstall/reconfigure/reset-params 依赖
++	// service_installer.go（systemd/launchd/Windows 服务集成），设备不用，
++	// 已在裁剪中移除。保留 run/start/stop/restart/status。
++	serviceCmd.AddCommand(runCmd, startCmd, stopCmd, restartCmd, svcStatusCmd)
  	serviceCmd.PersistentFlags().BoolVar(&profilesDisabled, "disable-profiles", false, "Disables profiles feature. If enabled, the client will not be able to change or edit any profile. To persist this setting, use: netbird service install --disable-profiles")
  	serviceCmd.PersistentFlags().BoolVar(&updateSettingsDisabled, "disable-update-settings", false, "Disables update settings feature. If enabled, the client will not be able to change or edit any settings. To persist this setting, use: netbird service install --disable-update-settings")
  	serviceCmd.PersistentFlags().BoolVar(&captureEnabled, "enable-capture", false, "Enables packet capture via 'netbird debug capture'. To persist, use: netbird service install --enable-capture")
-@@ -87,14 +87,6 @@ func init() {
+@@ -87,14 +90,6 @@ func init() {
  	serviceCmd.PersistentFlags().StringVar(&jsonSocket, "json-socket", defaultJSONSocket, "HTTP/JSON API socket address [unix|tcp]://[path|host:port]. Requires --enable-json-socket to serve. To persist, use: netbird service install --enable-json-socket --json-socket")
  
  	rootCmd.PersistentFlags().StringVarP(&serviceName, "service", "s", defaultServiceName, "Netbird system service name")
@@ -2250,20 +2256,22 @@ index 2a558e6..59cdc35 100644
  	rootCmd.AddCommand(serviceCmd)
  }
 diff --git a/client/cmd/service_controller.go b/client/cmd/service_controller.go
-index e9a0e05..e095e5f 100644
+index e9a0e055f..d4e3f96af 100644
 --- a/client/cmd/service_controller.go
 +++ b/client/cmd/service_controller.go
-@@ -249,7 +249,6 @@ var runCmd = &cobra.Command{
+@@ -249,7 +249,8 @@ var runCmd = &cobra.Command{
  		ctx, cancel := context.WithCancel(cmd.Context())
  
  		SetupCloseHandler(ctx, cancel)
 -		SetupDebugHandler(ctx, nil, nil, nil, util.FindFirstLogPath(logFiles))
++		// IP-KVM：SetupDebugHandler 属 debug.go（已裁剪）。它只挂 SIGUSR1
++		// 调试包钩子，正常启停不依赖它。
  
  		s, err := setupServiceControlCommand(cmd, ctx, cancel, false)
  		if err != nil {
 diff --git a/client/cmd/service_installer.go b/client/cmd/service_installer.go
 deleted file mode 100644
-index ae2dfb9..0000000
+index ae2dfb9fa..000000000
 --- a/client/cmd/service_installer.go
 +++ /dev/null
 @@ -1,338 +0,0 @@
@@ -2605,9 +2613,1106 @@ index ae2dfb9..0000000
 -
 -	return nil
 -}
+diff --git a/client/cmd/service_json_gateway_test.go b/client/cmd/service_json_gateway_test.go
+deleted file mode 100644
+index dfeef1c46..000000000
+--- a/client/cmd/service_json_gateway_test.go
++++ /dev/null
+@@ -1,261 +0,0 @@
+-//go:build !windows && !ios && !android
+-
+-package cmd
+-
+-import (
+-	"context"
+-	"net"
+-	"net/http"
+-	"path/filepath"
+-	"testing"
+-	"time"
+-
+-	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+-	"google.golang.org/grpc/credentials"
+-	"google.golang.org/grpc/metadata"
+-	"google.golang.org/grpc/peer"
+-
+-	"github.com/netbirdio/netbird/client/internal/ipcauth"
+-)
+-
+-// The JSON gateway runs inside the daemon and re-dials it locally, so every JSON
+-// request reaches a handler with the daemon's own identity as the transport peer.
+-// The gateway therefore forwards its HTTP client's identity as metadata, and the
+-// daemon authorizes that instead of itself. These tests drive the real wiring
+-// (jsonConnContext, forwardIdentity, jsonIncomingHeaderMatcher) and check the
+-// identity a handler would end up authorizing.
+-
+-// daemonSideCtx is what a handler sees for a gateway-relayed call. The transport
+-// peer must be this process's own identity: the gateway is the daemon, so the two
+-// cannot differ, and hardcoding root here instead would describe a state that
+-// never occurs.
+-func daemonSideCtx(t *testing.T, md metadata.MD) context.Context {
+-	t.Helper()
+-	self, err := ipcauth.CurrentProcessIdentity()
+-	if err != nil {
+-		t.Skipf("cannot read this process's identity: %v", err)
+-	}
+-	ctx := peer.NewContext(context.Background(), &peer.Peer{
+-		AuthInfo: ipcauth.AuthInfo{
+-			CommonAuthInfo: credentials.CommonAuthInfo{SecurityLevel: credentials.NoSecurity},
+-			Identity:       self,
+-		},
+-	})
+-	return metadata.NewIncomingContext(ctx, md)
+-}
+-
+-// gatewayMetadata reproduces what the daemon receives for a JSON request: the
+-// mux annotates the context from the request's headers, then the interceptor on the
+-// gateway's client connection stamps the caller's identity. The order matters,
+-// since the interceptor must win over anything a header put there.
+-func gatewayMetadata(t *testing.T, req *http.Request, ctx context.Context) metadata.MD {
+-	t.Helper()
+-	mux := runtime.NewServeMux(runtime.WithIncomingHeaderMatcher(jsonIncomingHeaderMatcher))
+-	annotated, err := runtime.AnnotateContext(ctx, mux, req,
+-		"/daemon.DaemonService/SetConfig",
+-		runtime.WithHTTPPathPattern("/daemon.DaemonService/SetConfig"))
+-	if err != nil {
+-		t.Fatalf("annotate: %v", err)
+-	}
+-
+-	md, ok := metadata.FromOutgoingContext(forwardIdentity(annotated))
+-	if !ok {
+-		t.Fatal("the interceptor produced no metadata")
+-	}
+-	return md
+-}
+-
+-// clientCtx is the connection context jsonConnContext would have produced for an
+-// HTTP client whose identity the gateway could read.
+-func clientCtx(id ipcauth.Identity, known bool) context.Context {
+-	return context.WithValue(context.Background(), jsonPeerIdentity{},
+-		jsonPeerIdentityValue{id: id, known: known})
+-}
+-
+-// An HTTP client must not be able to name its own identity. grpc-gateway turns
+-// Grpc-Metadata-<key> headers into gRPC metadata, so without the header filter and
+-// the interceptor overwriting the reserved keys, this request would authorize as
+-// uid 0.
+-func TestJSONGateway_ForgedIdentityHeaderIsDropped(t *testing.T) {
+-	req, err := http.NewRequest(http.MethodPost, "http://localhost/daemon.DaemonService/SetConfig", nil)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	req.Header.Set("Grpc-Metadata-X-Netbird-Fwd-Uid", "0")
+-	req.Header.Set("Grpc-Metadata-X-Netbird-Fwd-Gid", "0")
+-	req.Header.Set("Grpc-Metadata-X-Netbird-Fwd", "1")
+-	req.Header.Set("Grpc-Metadata-X-Netbird-Fwd-Sid", "S-1-5-18")
+-
+-	caller := ipcauth.Identity{UID: 31000, GID: 31000}
+-	md := gatewayMetadata(t, req, clientCtx(caller, true))
+-
+-	id, ok := ipcauth.CallerIdentity(daemonSideCtx(t, md))
+-	if !ok {
+-		t.Fatal("the forwarded identity should be usable")
+-	}
+-	if id.IsPrivileged() {
+-		t.Errorf("forged header was believed: authorized as %v", id)
+-	}
+-	if id.UID != caller.UID {
+-		t.Errorf("authorized as uid %d, want the real client %d", id.UID, caller.UID)
+-	}
+-}
+-
+-// A request with no headers at all (HTTP/1.0 needs no Host, and a unix socket
+-// yields no host:port) makes grpc-gateway produce no metadata whatsoever and skip
+-// its annotators: "if len(pairs) == 0 { return ctx, nil, nil }" in
+-// runtime/context.go. That is why the identity is stamped by an interceptor
+-// instead. This is the case that previously reached the gate as the daemon itself.
+-func TestJSONGateway_HeaderlessRequestIsStillMarkedForwarded(t *testing.T) {
+-	req, err := http.NewRequest(http.MethodPost, "http://localhost/daemon.DaemonService/SetConfig", nil)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	req.Header = http.Header{}
+-	req.Host = ""
+-
+-	caller := ipcauth.Identity{UID: 31000, GID: 31000}
+-	ctx := clientCtx(caller, true)
+-
+-	// Pin the skip path itself: if grpc-gateway ever produced a pair here, this
+-	// test would still pass below while no longer covering what it was written for.
+-	mux := runtime.NewServeMux(runtime.WithIncomingHeaderMatcher(jsonIncomingHeaderMatcher))
+-	annotated, err := runtime.AnnotateContext(ctx, mux, req,
+-		"/daemon.DaemonService/SetConfig",
+-		runtime.WithHTTPPathPattern("/daemon.DaemonService/SetConfig"))
+-	if err != nil {
+-		t.Fatalf("annotate: %v", err)
+-	}
+-	if md, ok := metadata.FromOutgoingContext(annotated); ok {
+-		t.Fatalf("grpc-gateway produced metadata %v for a headerless request; "+
+-			"this test no longer covers the annotator-skip path", md)
+-	}
+-
+-	md := gatewayMetadata(t, req, ctx)
+-
+-	id, ok := ipcauth.CallerIdentity(daemonSideCtx(t, md))
+-	if !ok {
+-		t.Fatal("the forwarded identity should be usable")
+-	}
+-	if id.UID != caller.UID || id.IsPrivileged() {
+-		t.Errorf("authorized as %v, want the real client uid %d", id, caller.UID)
+-	}
+-}
+-
+-// When the gateway cannot read its client's identity (a TCP JSON socket, say) it
+-// forwards the marker alone. The daemon must then report "unidentified" so the
+-// privileged operations refuse, rather than falling back to the gateway's own
+-// identity.
+-func TestJSONGateway_UnreadableClientIdentityIsUnidentified(t *testing.T) {
+-	req, err := http.NewRequest(http.MethodPost, "http://localhost/daemon.DaemonService/SetConfig", nil)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	md := gatewayMetadata(t, req, clientCtx(ipcauth.Identity{}, false))
+-
+-	if id, ok := ipcauth.CallerIdentity(daemonSideCtx(t, md)); ok {
+-		t.Errorf("a request with no client identity was authorized as %v", id)
+-	}
+-}
+-
+-// A request that never passed through jsonConnContext (no stashed identity) must
+-// also come out unidentified rather than as the daemon.
+-func TestJSONGateway_MissingConnContextIsUnidentified(t *testing.T) {
+-	req, err := http.NewRequest(http.MethodPost, "http://localhost/daemon.DaemonService/SetConfig", nil)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	md := gatewayMetadata(t, req, context.Background())
+-
+-	if id, ok := ipcauth.CallerIdentity(daemonSideCtx(t, md)); ok {
+-		t.Errorf("a request with no connection context was authorized as %v", id)
+-	}
+-}
+-
+-// End to end over a real unix socket: the gateway reads the connecting client's
+-// identity from the socket itself, so a client cannot present anything else.
+-func TestJSONGateway_IdentityComesFromTheSocket(t *testing.T) {
+-	mux := runtime.NewServeMux(runtime.WithIncomingHeaderMatcher(jsonIncomingHeaderMatcher))
+-
+-	type observed struct {
+-		md metadata.MD
+-	}
+-	seen := make(chan observed, 1)
+-
+-	srv := &http.Server{
+-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-			ctx, err := runtime.AnnotateContext(r.Context(), mux, r,
+-				"/daemon.DaemonService/SetConfig",
+-				runtime.WithHTTPPathPattern("/daemon.DaemonService/SetConfig"))
+-			if err != nil {
+-				t.Errorf("annotate: %v", err)
+-				return
+-			}
+-			md, _ := metadata.FromOutgoingContext(forwardIdentity(ctx))
+-			seen <- observed{md: md}
+-			w.WriteHeader(http.StatusOK)
+-		}),
+-		ReadHeaderTimeout: 5 * time.Second,
+-		ConnContext:       jsonConnContext,
+-	}
+-
+-	sock := filepath.Join(t.TempDir(), "http.sock")
+-	ln, err := net.Listen("unix", sock)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	t.Cleanup(func() {
+-		if err := srv.Close(); err != nil {
+-			t.Logf("close server: %v", err)
+-		}
+-	})
+-	go func() {
+-		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+-			t.Logf("serve: %v", err)
+-		}
+-	}()
+-
+-	conn, err := net.Dial("unix", sock)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	t.Cleanup(func() {
+-		if err := conn.Close(); err != nil {
+-			t.Logf("close conn: %v", err)
+-		}
+-	})
+-
+-	// Forge the identity headers on the wire as well.
+-	request := "POST /daemon.DaemonService/SetConfig HTTP/1.1\r\n" +
+-		"Host: localhost\r\n" +
+-		"Grpc-Metadata-X-Netbird-Fwd: 1\r\n" +
+-		"Grpc-Metadata-X-Netbird-Fwd-Uid: 0\r\n" +
+-		"Content-Length: 0\r\n\r\n"
+-	if _, err := conn.Write([]byte(request)); err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	select {
+-	case got := <-seen:
+-		self, err := ipcauth.CurrentProcessIdentity()
+-		if err != nil {
+-			t.Skipf("cannot read this process's identity: %v", err)
+-		}
+-		// The socket peer is this test process, so that is the identity the
+-		// gateway must forward, not the uid 0 the request asked for.
+-		if uids := got.md.Get("x-netbird-fwd-uid"); len(uids) != 1 {
+-			t.Fatalf("x-netbird-fwd-uid = %v, want exactly the gateway's own value", uids)
+-		}
+-		id, ok := ipcauth.CallerIdentity(daemonSideCtx(t, got.md))
+-		if !ok {
+-			t.Fatal("the forwarded identity should be usable")
+-		}
+-		if id.UID != self.UID {
+-			t.Errorf("authorized as uid %d, want the socket peer %d", id.UID, self.UID)
+-		}
+-	case <-time.After(5 * time.Second):
+-		t.Fatal("the gateway never handled the request")
+-	}
+-}
+diff --git a/client/cmd/service_json_socket_test.go b/client/cmd/service_json_socket_test.go
+deleted file mode 100644
+index 4b39794d7..000000000
+--- a/client/cmd/service_json_socket_test.go
++++ /dev/null
+@@ -1,176 +0,0 @@
+-//go:build !ios && !android
+-
+-package cmd
+-
+-import (
+-	"net"
+-	"os"
+-	"path/filepath"
+-	"runtime"
+-	"testing"
+-
+-	"github.com/spf13/cobra"
+-	"github.com/spf13/pflag"
+-	"github.com/stretchr/testify/assert"
+-	"github.com/stretchr/testify/require"
+-)
+-
+-func preserveJSONSocketTestState(t *testing.T) {
+-	t.Helper()
+-
+-	origJSONSocket := jsonSocket
+-	origEnableJSONSocket := enableJSONSocket
+-	origChanged := map[string]bool{}
+-	serviceCmd.PersistentFlags().VisitAll(func(flag *pflag.Flag) {
+-		origChanged[flag.Name] = flag.Changed
+-	})
+-
+-	t.Cleanup(func() {
+-		jsonSocket = origJSONSocket
+-		enableJSONSocket = origEnableJSONSocket
+-		serviceCmd.PersistentFlags().VisitAll(func(flag *pflag.Flag) {
+-			flag.Changed = origChanged[flag.Name]
+-		})
+-	})
+-}
+-
+-func TestJSONSocketFlagsArePositiveEnableOnly(t *testing.T) {
+-	assert.NotNil(t, serviceCmd.PersistentFlags().Lookup("enable-json-socket"))
+-	assert.NotNil(t, serviceCmd.PersistentFlags().Lookup("json-socket"))
+-	assert.Nil(t, serviceCmd.PersistentFlags().Lookup("disable-json-socket"))
+-	assert.Equal(t, "false", serviceCmd.PersistentFlags().Lookup("enable-json-socket").DefValue)
+-}
+-
+-func TestBuildServiceArgumentsDefaultDisablesJSONSocket(t *testing.T) {
+-	preserveJSONSocketTestState(t)
+-
+-	enableJSONSocket = false
+-	jsonSocket = "tcp://127.0.0.1:8080"
+-
+-	args := buildServiceArguments()
+-
+-	assert.NotContains(t, args, "--enable-json-socket")
+-	assert.NotContains(t, args, "--json-socket")
+-}
+-
+-func TestBuildServiceArgumentsIncludesJSONSocketWhenEnabled(t *testing.T) {
+-	preserveJSONSocketTestState(t)
+-
+-	enableJSONSocket = true
+-	jsonSocket = "tcp://127.0.0.1:8080"
+-
+-	args := buildServiceArguments()
+-
+-	enableIndex := indexOfArg(args, "--enable-json-socket")
+-	jsonIndex := indexOfArg(args, "--json-socket")
+-	require.NotEqual(t, -1, enableIndex)
+-	require.NotEqual(t, -1, jsonIndex)
+-	require.Less(t, enableIndex, jsonIndex)
+-	require.Less(t, jsonIndex+1, len(args))
+-	assert.Equal(t, "tcp://127.0.0.1:8080", args[jsonIndex+1])
+-}
+-
+-func TestJSONSocketWithoutEnableValidation(t *testing.T) {
+-	preserveJSONSocketTestState(t)
+-
+-	enableJSONSocket = false
+-	require.NoError(t, serviceCmd.PersistentFlags().Set("json-socket", "tcp://127.0.0.1:8080"))
+-
+-	err := validateJSONSocketFlags()
+-
+-	require.Error(t, err)
+-	assert.Contains(t, err.Error(), "--enable-json-socket")
+-}
+-
+-func TestJSONSocketWithEnableValidation(t *testing.T) {
+-	preserveJSONSocketTestState(t)
+-
+-	require.NoError(t, serviceCmd.PersistentFlags().Set("enable-json-socket", "true"))
+-	require.NoError(t, serviceCmd.PersistentFlags().Set("json-socket", "tcp://127.0.0.1:8080"))
+-
+-	assert.NoError(t, validateJSONSocketFlags())
+-}
+-
+-func TestJSONSocketServiceParamsPersistEnableAndAddress(t *testing.T) {
+-	preserveJSONSocketTestState(t)
+-	serviceCmd.PersistentFlags().VisitAll(func(flag *pflag.Flag) {
+-		flag.Changed = false
+-	})
+-
+-	enableJSONSocket = true
+-	jsonSocket = "tcp://127.0.0.1:8080"
+-
+-	params := currentServiceParams()
+-	require.True(t, params.EnableJSONSocket)
+-	require.Equal(t, "tcp://127.0.0.1:8080", params.JSONSocket)
+-
+-	enableJSONSocket = false
+-	jsonSocket = defaultJSONSocket
+-	applyServiceParams(testServiceEnvCommand(), params)
+-
+-	assert.True(t, enableJSONSocket)
+-	assert.Equal(t, "tcp://127.0.0.1:8080", jsonSocket)
+-}
+-
+-func TestRemoveStaleUnixSocketDoesNotRemoveRegularFile(t *testing.T) {
+-	path := filepath.Join(t.TempDir(), "netbird-http.sock")
+-	require.NoError(t, os.WriteFile(path, []byte("not a socket"), 0600))
+-
+-	removeStaleUnixSocket(path)
+-
+-	data, err := os.ReadFile(path)
+-	require.NoError(t, err)
+-	assert.Equal(t, []byte("not a socket"), data)
+-}
+-
+-func TestRemoveStaleUnixSocketRemovesSocket(t *testing.T) {
+-	if runtime.GOOS == "windows" {
+-		t.Skip("unix sockets are not available on Windows")
+-	}
+-
+-	path := filepath.Join(t.TempDir(), "netbird-http.sock")
+-	addr := &net.UnixAddr{Name: path, Net: "unix"}
+-	listener, err := net.ListenUnix("unix", addr)
+-	require.NoError(t, err)
+-	listener.SetUnlinkOnClose(false)
+-	require.NoError(t, listener.Close())
+-
+-	_, err = os.Lstat(path)
+-	require.NoError(t, err, "test setup must leave a stale Unix socket path")
+-
+-	removeStaleUnixSocket(path)
+-
+-	_, err = os.Lstat(path)
+-	assert.True(t, os.IsNotExist(err), "expected stale Unix socket to be removed, got %v", err)
+-}
+-
+-func TestRemoveStaleUnixSocketDoesNotRemoveLiveSocket(t *testing.T) {
+-	if runtime.GOOS == "windows" {
+-		t.Skip("unix sockets are not available on Windows")
+-	}
+-
+-	path := filepath.Join(t.TempDir(), "netbird-http.sock")
+-	listener, err := net.Listen("unix", path)
+-	require.NoError(t, err)
+-	defer listener.Close()
+-
+-	removeStaleUnixSocket(path)
+-
+-	_, err = os.Lstat(path)
+-	assert.NoError(t, err, "expected live Unix socket to be preserved")
+-}
+-
+-func testServiceEnvCommand() *cobra.Command {
+-	cmd := &cobra.Command{}
+-	cmd.Flags().StringSlice("service-env", nil, "")
+-	return cmd
+-}
+-
+-func indexOfArg(args []string, arg string) int {
+-	for i, candidate := range args {
+-		if candidate == arg {
+-			return i
+-		}
+-	}
+-	return -1
+-}
+diff --git a/client/cmd/service_params_test.go b/client/cmd/service_params_test.go
+deleted file mode 100644
+index 1f83374cb..000000000
+--- a/client/cmd/service_params_test.go
++++ /dev/null
+@@ -1,642 +0,0 @@
+-//go:build !ios && !android
+-
+-package cmd
+-
+-import (
+-	"encoding/json"
+-	"go/ast"
+-	"go/parser"
+-	"go/token"
+-	"os"
+-	"path/filepath"
+-	"runtime"
+-	"strings"
+-	"testing"
+-
+-	"github.com/spf13/cobra"
+-	"github.com/spf13/pflag"
+-	"github.com/stretchr/testify/assert"
+-	"github.com/stretchr/testify/require"
+-
+-	"github.com/netbirdio/netbird/client/configs"
+-)
+-
+-func TestServiceParamsPath(t *testing.T) {
+-	original := configs.StateDir
+-	t.Cleanup(func() { configs.StateDir = original })
+-
+-	configs.StateDir = "/var/lib/netbird"
+-	assert.Equal(t, filepath.Join("/var/lib/netbird", "service.json"), serviceParamsPath())
+-
+-	configs.StateDir = "/custom/state"
+-	assert.Equal(t, filepath.Join("/custom/state", "service.json"), serviceParamsPath())
+-}
+-
+-func TestSaveAndLoadServiceParams(t *testing.T) {
+-	tmpDir := t.TempDir()
+-
+-	original := configs.StateDir
+-	t.Cleanup(func() { configs.StateDir = original })
+-	configs.StateDir = tmpDir
+-
+-	params := &serviceParams{
+-		LogLevel:              "debug",
+-		DaemonAddr:            "unix:///var/run/netbird.sock",
+-		JSONSocket:            "tcp://127.0.0.1:8080",
+-		EnableJSONSocket:      true,
+-		ManagementURL:         "https://my.server.com",
+-		ConfigPath:            "/etc/netbird/config.json",
+-		LogFiles:              []string{"/var/log/netbird/client.log", "console"},
+-		DisableProfiles:       true,
+-		DisableUpdateSettings: false,
+-		ServiceEnvVars:        map[string]string{"NB_LOG_FORMAT": "json", "CUSTOM": "val"},
+-	}
+-
+-	err := saveServiceParams(params)
+-	require.NoError(t, err)
+-
+-	// Verify the file exists and is valid JSON.
+-	data, err := os.ReadFile(filepath.Join(tmpDir, "service.json"))
+-	require.NoError(t, err)
+-	assert.True(t, json.Valid(data))
+-
+-	loaded, err := loadServiceParams()
+-	require.NoError(t, err)
+-	require.NotNil(t, loaded)
+-
+-	assert.Equal(t, params.LogLevel, loaded.LogLevel)
+-	assert.Equal(t, params.DaemonAddr, loaded.DaemonAddr)
+-	assert.Equal(t, params.JSONSocket, loaded.JSONSocket)
+-	assert.Equal(t, params.EnableJSONSocket, loaded.EnableJSONSocket)
+-	assert.Equal(t, params.ManagementURL, loaded.ManagementURL)
+-	assert.Equal(t, params.ConfigPath, loaded.ConfigPath)
+-	assert.Equal(t, params.LogFiles, loaded.LogFiles)
+-	assert.Equal(t, params.DisableProfiles, loaded.DisableProfiles)
+-	assert.Equal(t, params.DisableUpdateSettings, loaded.DisableUpdateSettings)
+-	assert.Equal(t, params.ServiceEnvVars, loaded.ServiceEnvVars)
+-}
+-
+-func TestLoadServiceParams_FileNotExists(t *testing.T) {
+-	tmpDir := t.TempDir()
+-
+-	original := configs.StateDir
+-	t.Cleanup(func() { configs.StateDir = original })
+-	configs.StateDir = tmpDir
+-
+-	params, err := loadServiceParams()
+-	assert.NoError(t, err)
+-	assert.Nil(t, params)
+-}
+-
+-func TestLoadServiceParams_InvalidJSON(t *testing.T) {
+-	tmpDir := t.TempDir()
+-
+-	original := configs.StateDir
+-	t.Cleanup(func() { configs.StateDir = original })
+-	configs.StateDir = tmpDir
+-
+-	err := os.WriteFile(filepath.Join(tmpDir, "service.json"), []byte("not json"), 0600)
+-	require.NoError(t, err)
+-
+-	params, err := loadServiceParams()
+-	assert.Error(t, err)
+-	assert.Nil(t, params)
+-}
+-
+-func TestCurrentServiceParams(t *testing.T) {
+-	origLogLevel := logLevel
+-	origDaemonAddr := daemonAddr
+-	origJSONSocket := jsonSocket
+-	origEnableJSONSocket := enableJSONSocket
+-	origManagementURL := managementURL
+-	origConfigPath := configPath
+-	origLogFiles := logFiles
+-	origProfilesDisabled := profilesDisabled
+-	origUpdateSettingsDisabled := updateSettingsDisabled
+-	origServiceEnvVars := serviceEnvVars
+-	t.Cleanup(func() {
+-		logLevel = origLogLevel
+-		daemonAddr = origDaemonAddr
+-		jsonSocket = origJSONSocket
+-		enableJSONSocket = origEnableJSONSocket
+-		managementURL = origManagementURL
+-		configPath = origConfigPath
+-		logFiles = origLogFiles
+-		profilesDisabled = origProfilesDisabled
+-		updateSettingsDisabled = origUpdateSettingsDisabled
+-		serviceEnvVars = origServiceEnvVars
+-	})
+-
+-	logLevel = "trace"
+-	daemonAddr = "tcp://127.0.0.1:9999"
+-	jsonSocket = "tcp://127.0.0.1:8080"
+-	enableJSONSocket = true
+-	managementURL = "https://mgmt.example.com"
+-	configPath = "/tmp/test-config.json"
+-	logFiles = []string{"/tmp/test.log"}
+-	profilesDisabled = true
+-	updateSettingsDisabled = true
+-	serviceEnvVars = []string{"FOO=bar", "BAZ=qux"}
+-
+-	params := currentServiceParams()
+-
+-	assert.Equal(t, "trace", params.LogLevel)
+-	assert.Equal(t, "tcp://127.0.0.1:9999", params.DaemonAddr)
+-	assert.Equal(t, "tcp://127.0.0.1:8080", params.JSONSocket)
+-	assert.True(t, params.EnableJSONSocket)
+-	assert.Equal(t, "https://mgmt.example.com", params.ManagementURL)
+-	assert.Equal(t, "/tmp/test-config.json", params.ConfigPath)
+-	assert.Equal(t, []string{"/tmp/test.log"}, params.LogFiles)
+-	assert.True(t, params.DisableProfiles)
+-	assert.True(t, params.DisableUpdateSettings)
+-	assert.Equal(t, map[string]string{"FOO": "bar", "BAZ": "qux"}, params.ServiceEnvVars)
+-}
+-
+-func TestApplyServiceParams_OnlyUnchangedFlags(t *testing.T) {
+-	origLogLevel := logLevel
+-	origDaemonAddr := daemonAddr
+-	origJSONSocket := jsonSocket
+-	origEnableJSONSocket := enableJSONSocket
+-	origManagementURL := managementURL
+-	origConfigPath := configPath
+-	origLogFiles := logFiles
+-	origProfilesDisabled := profilesDisabled
+-	origUpdateSettingsDisabled := updateSettingsDisabled
+-	origServiceEnvVars := serviceEnvVars
+-	t.Cleanup(func() {
+-		logLevel = origLogLevel
+-		daemonAddr = origDaemonAddr
+-		jsonSocket = origJSONSocket
+-		enableJSONSocket = origEnableJSONSocket
+-		managementURL = origManagementURL
+-		configPath = origConfigPath
+-		logFiles = origLogFiles
+-		profilesDisabled = origProfilesDisabled
+-		updateSettingsDisabled = origUpdateSettingsDisabled
+-		serviceEnvVars = origServiceEnvVars
+-	})
+-
+-	// Reset all flags to defaults.
+-	logLevel = "info"
+-	daemonAddr = "unix:///var/run/netbird.sock"
+-	jsonSocket = defaultJSONSocket
+-	enableJSONSocket = false
+-	managementURL = ""
+-	configPath = "/etc/netbird/config.json"
+-	logFiles = []string{"/var/log/netbird/client.log"}
+-	profilesDisabled = false
+-	updateSettingsDisabled = false
+-	serviceEnvVars = nil
+-
+-	// Reset Changed state on all relevant flags.
+-	rootCmd.PersistentFlags().VisitAll(func(f *pflag.Flag) {
+-		f.Changed = false
+-	})
+-	serviceCmd.PersistentFlags().VisitAll(func(f *pflag.Flag) {
+-		f.Changed = false
+-	})
+-
+-	// Simulate user explicitly setting --log-level via CLI.
+-	logLevel = "warn"
+-	require.NoError(t, rootCmd.PersistentFlags().Set("log-level", "warn"))
+-
+-	saved := &serviceParams{
+-		LogLevel:              "debug",
+-		DaemonAddr:            "tcp://127.0.0.1:5555",
+-		JSONSocket:            "tcp://127.0.0.1:8080",
+-		EnableJSONSocket:      true,
+-		ManagementURL:         "https://saved.example.com",
+-		ConfigPath:            "/saved/config.json",
+-		LogFiles:              []string{"/saved/client.log"},
+-		DisableProfiles:       true,
+-		DisableUpdateSettings: true,
+-		ServiceEnvVars:        map[string]string{"SAVED_KEY": "saved_val"},
+-	}
+-
+-	cmd := &cobra.Command{}
+-	cmd.Flags().StringSlice("service-env", nil, "")
+-	applyServiceParams(cmd, saved)
+-
+-	// log-level was Changed, so it should keep "warn", not use saved "debug".
+-	assert.Equal(t, "warn", logLevel)
+-
+-	// All other fields were not Changed, so they should use saved values.
+-	assert.Equal(t, "tcp://127.0.0.1:5555", daemonAddr)
+-	assert.Equal(t, "tcp://127.0.0.1:8080", jsonSocket)
+-	assert.True(t, enableJSONSocket)
+-	assert.Equal(t, "https://saved.example.com", managementURL)
+-	assert.Equal(t, "/saved/config.json", configPath)
+-	assert.Equal(t, []string{"/saved/client.log"}, logFiles)
+-	assert.True(t, profilesDisabled)
+-	assert.True(t, updateSettingsDisabled)
+-	assert.Equal(t, []string{"SAVED_KEY=saved_val"}, serviceEnvVars)
+-}
+-
+-func TestApplyServiceParams_BooleanRevertToFalse(t *testing.T) {
+-	origProfilesDisabled := profilesDisabled
+-	origUpdateSettingsDisabled := updateSettingsDisabled
+-	origEnableJSONSocket := enableJSONSocket
+-	t.Cleanup(func() {
+-		profilesDisabled = origProfilesDisabled
+-		updateSettingsDisabled = origUpdateSettingsDisabled
+-		enableJSONSocket = origEnableJSONSocket
+-	})
+-
+-	// Simulate current state where booleans are true (e.g. set by previous install).
+-	profilesDisabled = true
+-	updateSettingsDisabled = true
+-	enableJSONSocket = true
+-
+-	// Reset Changed state so flags appear unset.
+-	serviceCmd.PersistentFlags().VisitAll(func(f *pflag.Flag) {
+-		f.Changed = false
+-	})
+-
+-	// Saved params have both as false.
+-	saved := &serviceParams{
+-		DisableProfiles:       false,
+-		DisableUpdateSettings: false,
+-	}
+-
+-	cmd := &cobra.Command{}
+-	cmd.Flags().StringSlice("service-env", nil, "")
+-	applyServiceParams(cmd, saved)
+-
+-	assert.False(t, profilesDisabled, "saved false should override current true")
+-	assert.False(t, updateSettingsDisabled, "saved false should override current true")
+-	assert.False(t, enableJSONSocket, "saved false should override current true")
+-}
+-
+-func TestApplyServiceParams_ClearManagementURL(t *testing.T) {
+-	origManagementURL := managementURL
+-	t.Cleanup(func() { managementURL = origManagementURL })
+-
+-	managementURL = "https://leftover.example.com"
+-
+-	// Simulate saved params where management URL was explicitly cleared.
+-	saved := &serviceParams{
+-		LogLevel:   "info",
+-		DaemonAddr: "unix:///var/run/netbird.sock",
+-		// ManagementURL intentionally empty: was cleared with --management-url "".
+-	}
+-
+-	rootCmd.PersistentFlags().VisitAll(func(f *pflag.Flag) {
+-		f.Changed = false
+-	})
+-
+-	cmd := &cobra.Command{}
+-	cmd.Flags().StringSlice("service-env", nil, "")
+-	applyServiceParams(cmd, saved)
+-
+-	assert.Equal(t, "", managementURL, "saved empty management URL should clear the current value")
+-}
+-
+-func TestApplyServiceParams_NilParams(t *testing.T) {
+-	origLogLevel := logLevel
+-	t.Cleanup(func() { logLevel = origLogLevel })
+-
+-	logLevel = "info"
+-	cmd := &cobra.Command{}
+-	cmd.Flags().StringSlice("service-env", nil, "")
+-
+-	// Should be a no-op.
+-	applyServiceParams(cmd, nil)
+-	assert.Equal(t, "info", logLevel)
+-}
+-
+-func TestApplyServiceEnvParams_MergeExplicitAndSaved(t *testing.T) {
+-	origServiceEnvVars := serviceEnvVars
+-	t.Cleanup(func() { serviceEnvVars = origServiceEnvVars })
+-
+-	// Set up a command with --service-env marked as Changed.
+-	cmd := &cobra.Command{}
+-	cmd.Flags().StringSlice("service-env", nil, "")
+-	require.NoError(t, cmd.Flags().Set("service-env", "EXPLICIT=yes,OVERLAP=explicit"))
+-
+-	serviceEnvVars = []string{"EXPLICIT=yes", "OVERLAP=explicit"}
+-
+-	saved := &serviceParams{
+-		ServiceEnvVars: map[string]string{
+-			"SAVED":   "val",
+-			"OVERLAP": "saved",
+-		},
+-	}
+-
+-	applyServiceEnvParams(cmd, saved)
+-
+-	// Parse result for easier assertion.
+-	result, err := parseServiceEnvVars(serviceEnvVars)
+-	require.NoError(t, err)
+-
+-	assert.Equal(t, "yes", result["EXPLICIT"])
+-	assert.Equal(t, "val", result["SAVED"])
+-	// Explicit wins on conflict.
+-	assert.Equal(t, "explicit", result["OVERLAP"])
+-}
+-
+-func TestApplyServiceEnvParams_NotChanged(t *testing.T) {
+-	origServiceEnvVars := serviceEnvVars
+-	t.Cleanup(func() { serviceEnvVars = origServiceEnvVars })
+-
+-	serviceEnvVars = nil
+-
+-	cmd := &cobra.Command{}
+-	cmd.Flags().StringSlice("service-env", nil, "")
+-
+-	saved := &serviceParams{
+-		ServiceEnvVars: map[string]string{"FROM_SAVED": "val"},
+-	}
+-
+-	applyServiceEnvParams(cmd, saved)
+-
+-	result, err := parseServiceEnvVars(serviceEnvVars)
+-	require.NoError(t, err)
+-	assert.Equal(t, map[string]string{"FROM_SAVED": "val"}, result)
+-}
+-
+-func TestParseServiceEnvVars_RejectsForbiddenNames(t *testing.T) {
+-	for _, env := range []string{"PATH=C:\\somewhere", "LD_PRELOAD=/tmp/lib.so", "DYLD_FALLBACK_LIBRARY_PATH=/tmp"} {
+-		_, err := parseServiceEnvVars([]string{"KEEP=me", env})
+-		require.Errorf(t, err, "%s selects what the service resolves and must be refused", env)
+-	}
+-}
+-
+-func TestIsForbiddenServiceEnvVar(t *testing.T) {
+-	// The loader families are matched by prefix, so a name nobody has heard of
+-	// yet is refused too.
+-	for _, name := range []string{
+-		"PATH", "PATHEXT", "COMSPEC", "SYSTEMROOT", "WINDIR", "TEMP", "TMP",
+-		"LD_PRELOAD", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "DYLD_FALLBACK_FRAMEWORK_PATH",
+-	} {
+-		assert.Truef(t, isForbiddenServiceEnvVar(name), "%s must be refused", name)
+-	}
+-
+-	// The prefix must not swallow names that merely start with the same letters.
+-	for _, name := range []string{"NB_LOG_LEVEL", "NB_WG_DEBUG", "HTTPS_PROXY", "LDAP_URL", "DYLDX"} {
+-		assert.Falsef(t, isForbiddenServiceEnvVar(name), "%s has no reason to be refused", name)
+-	}
+-
+-	// On Windows a variable is the same one however it is spelled; elsewhere
+-	// Path and PATH are two variables and only the exact one is read.
+-	if runtime.GOOS == "windows" {
+-		assert.True(t, isForbiddenServiceEnvVar("Path"))
+-		assert.True(t, isForbiddenServiceEnvVar("ld_preload"))
+-	} else {
+-		assert.False(t, isForbiddenServiceEnvVar("Path"))
+-		assert.False(t, isForbiddenServiceEnvVar("ld_preload"))
+-	}
+-}
+-
+-func TestApplyServiceEnvParams_DropsForbiddenSavedNames(t *testing.T) {
+-	origServiceEnvVars := serviceEnvVars
+-	t.Cleanup(func() { serviceEnvVars = origServiceEnvVars })
+-
+-	serviceEnvVars = nil
+-
+-	cmd := &cobra.Command{}
+-	cmd.Flags().StringSlice("service-env", nil, "")
+-
+-	saved := &serviceParams{
+-		ServiceEnvVars: map[string]string{"PATH": "C:\\attacker", "NB_LOG_FORMAT": "json"},
+-	}
+-
+-	applyServiceEnvParams(cmd, saved)
+-
+-	result, err := parseServiceEnvVars(serviceEnvVars)
+-	require.NoError(t, err, "a saved PATH must be dropped rather than fail the install")
+-	assert.Equal(t, map[string]string{"NB_LOG_FORMAT": "json"}, result)
+-}
+-
+-func TestApplyServiceEnvParams_ExplicitEmptyClears(t *testing.T) {
+-	origServiceEnvVars := serviceEnvVars
+-	t.Cleanup(func() { serviceEnvVars = origServiceEnvVars })
+-
+-	// Simulate --service-env "" which produces [""] in the slice.
+-	serviceEnvVars = []string{""}
+-
+-	cmd := &cobra.Command{}
+-	cmd.Flags().StringSlice("service-env", nil, "")
+-	require.NoError(t, cmd.Flags().Set("service-env", ""))
+-
+-	saved := &serviceParams{
+-		ServiceEnvVars: map[string]string{"OLD_VAR": "should_be_cleared"},
+-	}
+-
+-	applyServiceEnvParams(cmd, saved)
+-
+-	assert.Nil(t, serviceEnvVars, "explicit empty --service-env should clear all saved env vars")
+-}
+-
+-func TestCurrentServiceParams_EmptyEnvVarsAfterParse(t *testing.T) {
+-	origServiceEnvVars := serviceEnvVars
+-	t.Cleanup(func() { serviceEnvVars = origServiceEnvVars })
+-
+-	// Simulate --service-env "" which produces [""] in the slice.
+-	serviceEnvVars = []string{""}
+-
+-	params := currentServiceParams()
+-
+-	// After parsing, the empty string is skipped, resulting in an empty map.
+-	// The map should still be set (not nil) so it overwrites saved values.
+-	assert.NotNil(t, params.ServiceEnvVars, "empty env vars should produce empty map, not nil")
+-	assert.Empty(t, params.ServiceEnvVars, "no valid env vars should be parsed from empty string")
+-}
+-
+-// TestServiceParams_FieldsCoveredInFunctions ensures that all serviceParams fields are
+-// referenced in both currentServiceParams() and applyServiceParams(). If a new field is
+-// added to serviceParams but not wired into these functions, this test fails.
+-func TestServiceParams_FieldsCoveredInFunctions(t *testing.T) {
+-	fset := token.NewFileSet()
+-	file, err := parser.ParseFile(fset, "service_params.go", nil, 0)
+-	require.NoError(t, err)
+-
+-	// Collect all JSON field names from the serviceParams struct.
+-	structFields := extractStructJSONFields(t, file, "serviceParams")
+-	require.NotEmpty(t, structFields, "failed to find serviceParams struct fields")
+-
+-	// Collect field names referenced in currentServiceParams and applyServiceParams.
+-	currentFields := extractFuncFieldRefs(t, file, "currentServiceParams", structFields)
+-	applyFields := extractFuncFieldRefs(t, file, "applyServiceParams", structFields)
+-	// applyServiceEnvParams handles ServiceEnvVars indirectly.
+-	applyEnvFields := extractFuncFieldRefs(t, file, "applyServiceEnvParams", structFields)
+-	for k, v := range applyEnvFields {
+-		applyFields[k] = v
+-	}
+-
+-	for _, field := range structFields {
+-		assert.Contains(t, currentFields, field,
+-			"serviceParams field %q is not captured in currentServiceParams()", field)
+-		assert.Contains(t, applyFields, field,
+-			"serviceParams field %q is not restored in applyServiceParams()/applyServiceEnvParams()", field)
+-	}
+-}
+-
+-// TestServiceParams_BuildArgsCoversAllFlags ensures that buildServiceArguments references
+-// all serviceParams fields that should become CLI args. ServiceEnvVars is excluded because
+-// it flows through newSVCConfig() EnvVars, not CLI args.
+-func TestServiceParams_BuildArgsCoversAllFlags(t *testing.T) {
+-	fset := token.NewFileSet()
+-	file, err := parser.ParseFile(fset, "service_params.go", nil, 0)
+-	require.NoError(t, err)
+-
+-	structFields := extractStructJSONFields(t, file, "serviceParams")
+-	require.NotEmpty(t, structFields)
+-
+-	installerFile, err := parser.ParseFile(fset, "service_installer.go", nil, 0)
+-	require.NoError(t, err)
+-
+-	// Fields that are handled outside of buildServiceArguments (env vars go through newSVCConfig).
+-	fieldsNotInArgs := map[string]bool{
+-		"ServiceEnvVars": true,
+-	}
+-
+-	buildFields := extractFuncGlobalRefs(t, installerFile, "buildServiceArguments")
+-
+-	// Forward: every struct field must appear in buildServiceArguments.
+-	for _, field := range structFields {
+-		if fieldsNotInArgs[field] {
+-			continue
+-		}
+-		globalVar := fieldToGlobalVar(field)
+-		assert.Contains(t, buildFields, globalVar,
+-			"serviceParams field %q (global %q) is not referenced in buildServiceArguments()", field, globalVar)
+-	}
+-
+-	// Reverse: every service-related global used in buildServiceArguments must
+-	// have a corresponding serviceParams field. This catches a developer adding
+-	// a new flag to buildServiceArguments without adding it to the struct.
+-	globalToField := make(map[string]string, len(structFields))
+-	for _, field := range structFields {
+-		globalToField[fieldToGlobalVar(field)] = field
+-	}
+-	// Identifiers in buildServiceArguments that are not service params
+-	// (builtins, boilerplate, loop variables).
+-	nonParamGlobals := map[string]bool{
+-		"args": true, "append": true, "string": true, "_": true,
+-		"logFile": true, // range variable over logFiles
+-	}
+-	for ref := range buildFields {
+-		if nonParamGlobals[ref] {
+-			continue
+-		}
+-		_, inStruct := globalToField[ref]
+-		assert.True(t, inStruct,
+-			"buildServiceArguments() references global %q which has no corresponding serviceParams field", ref)
+-	}
+-}
+-
+-// extractStructJSONFields returns field names from a named struct type.
+-func extractStructJSONFields(t *testing.T, file *ast.File, structName string) []string {
+-	t.Helper()
+-	var fields []string
+-	ast.Inspect(file, func(n ast.Node) bool {
+-		ts, ok := n.(*ast.TypeSpec)
+-		if !ok || ts.Name.Name != structName {
+-			return true
+-		}
+-		st, ok := ts.Type.(*ast.StructType)
+-		if !ok {
+-			return false
+-		}
+-		for _, f := range st.Fields.List {
+-			if len(f.Names) > 0 {
+-				fields = append(fields, f.Names[0].Name)
+-			}
+-		}
+-		return false
+-	})
+-	return fields
+-}
+-
+-// extractFuncFieldRefs returns which of the given field names appear inside the
+-// named function, either as selector expressions (params.FieldName) or as
+-// composite literal keys (&serviceParams{FieldName: ...}).
+-func extractFuncFieldRefs(t *testing.T, file *ast.File, funcName string, fields []string) map[string]bool {
+-	t.Helper()
+-	fieldSet := make(map[string]bool, len(fields))
+-	for _, f := range fields {
+-		fieldSet[f] = true
+-	}
+-
+-	found := make(map[string]bool)
+-	fn := findFuncDecl(file, funcName)
+-	require.NotNil(t, fn, "function %s not found", funcName)
+-
+-	ast.Inspect(fn.Body, func(n ast.Node) bool {
+-		switch v := n.(type) {
+-		case *ast.SelectorExpr:
+-			if fieldSet[v.Sel.Name] {
+-				found[v.Sel.Name] = true
+-			}
+-		case *ast.KeyValueExpr:
+-			if ident, ok := v.Key.(*ast.Ident); ok && fieldSet[ident.Name] {
+-				found[ident.Name] = true
+-			}
+-		}
+-		return true
+-	})
+-	return found
+-}
+-
+-// extractFuncGlobalRefs returns all identifier names referenced in the named function body.
+-func extractFuncGlobalRefs(t *testing.T, file *ast.File, funcName string) map[string]bool {
+-	t.Helper()
+-	fn := findFuncDecl(file, funcName)
+-	require.NotNil(t, fn, "function %s not found", funcName)
+-
+-	refs := make(map[string]bool)
+-	ast.Inspect(fn.Body, func(n ast.Node) bool {
+-		if ident, ok := n.(*ast.Ident); ok {
+-			refs[ident.Name] = true
+-		}
+-		return true
+-	})
+-	return refs
+-}
+-
+-func findFuncDecl(file *ast.File, name string) *ast.FuncDecl {
+-	for _, decl := range file.Decls {
+-		fn, ok := decl.(*ast.FuncDecl)
+-		if ok && fn.Name.Name == name {
+-			return fn
+-		}
+-	}
+-	return nil
+-}
+-
+-// fieldToGlobalVar maps serviceParams field names to the package-level variable
+-// names used in buildServiceArguments and applyServiceParams.
+-func fieldToGlobalVar(field string) string {
+-	m := map[string]string{
+-		"LogLevel":              "logLevel",
+-		"DaemonAddr":            "daemonAddr",
+-		"JSONSocket":            "jsonSocket",
+-		"ManagementURL":         "managementURL",
+-		"ConfigPath":            "configPath",
+-		"LogFiles":              "logFiles",
+-		"DisableProfiles":       "profilesDisabled",
+-		"DisableUpdateSettings": "updateSettingsDisabled",
+-		"EnableCapture":         "captureEnabled",
+-		"DisableNetworks":       "networksDisabled",
+-		"EnableJSONSocket":      "enableJSONSocket",
+-		"ServiceEnvVars":        "serviceEnvVars",
+-	}
+-	if v, ok := m[field]; ok {
+-		return v
+-	}
+-	// Default: lowercase first letter.
+-	return strings.ToLower(field[:1]) + field[1:]
+-}
+-
+-func TestEnvMapToSlice(t *testing.T) {
+-	m := map[string]string{"A": "1", "B": "2"}
+-	s := envMapToSlice(m)
+-	assert.Len(t, s, 2)
+-	assert.Contains(t, s, "A=1")
+-	assert.Contains(t, s, "B=2")
+-}
+-
+-func TestEnvMapToSlice_Empty(t *testing.T) {
+-	s := envMapToSlice(map[string]string{})
+-	assert.Empty(t, s)
+-}
 diff --git a/client/cmd/ssh.go b/client/cmd/ssh.go
 deleted file mode 100644
-index d6e052e..0000000
+index d6e052e08..000000000
 --- a/client/cmd/ssh.go
 +++ /dev/null
 @@ -1,888 +0,0 @@
@@ -3501,7 +4606,7 @@ index d6e052e..0000000
 -}
 diff --git a/client/cmd/ssh_exec_unix.go b/client/cmd/ssh_exec_unix.go
 deleted file mode 100644
-index 2412f07..0000000
+index 2412f072c..000000000
 --- a/client/cmd/ssh_exec_unix.go
 +++ /dev/null
 @@ -1,74 +0,0 @@
@@ -3581,17 +4686,20 @@ index 2412f07..0000000
 -}
 diff --git a/client/cmd/ssh_flags.go b/client/cmd/ssh_flags.go
 new file mode 100644
-index 0000000..6e6d420
+index 000000000..739cb9ccf
 --- /dev/null
 +++ b/client/cmd/ssh_flags.go
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,40 @@
++// IP-KVM：这是 ssh.go 里**仅剩的、仍被 up.go 引用**的部分。
++//
++// ssh.go 本体（`netbird ssh` 客户端命令 + SSH 服务端配置下发）已随裁剪移除：
++// 它要引 client/ssh 网关、profilemanager 的 SSH 状态与整套 pty/known_hosts
++// 处理，对 IP-KVM 场景无价值。
++//
++// 但这些 flag 定义必须保留：up.go 有多处 `cmd.Flag(serverSSHAllowedFlag).Changed`
++// 之类的判断。删掉定义会让 `netbird up` 编不过，进而整个二进制起不来。
++// flag 保留后行为与"用户没传"一致——daemon 沿用已持久化的设置。
 +package cmd
-+
-+// The SSH *server* opt-in flags live here rather than in ssh.go: they are
-+// registered on `up`/`login` and stored in the profile, and `up.go` reads
-+// them to build SetConfig/Login requests. The `ssh` client subcommand itself
-+// (and the SSH client/SFTP/proxy/detection packages it needs) is not built in
-+// the IP-KVM image, so ssh.go is excluded from the build.
 +
 +const (
 +	serverSSHAllowedFlag           = "allow-server-ssh"
@@ -3624,7 +4732,7 @@ index 0000000..6e6d420
 +}
 diff --git a/client/cmd/ssh_sftp_unix.go b/client/cmd/ssh_sftp_unix.go
 deleted file mode 100644
-index c06aab0..0000000
+index c06aab017..000000000
 --- a/client/cmd/ssh_sftp_unix.go
 +++ /dev/null
 @@ -1,94 +0,0 @@
@@ -3724,7 +4832,7 @@ index c06aab0..0000000
 -}
 diff --git a/client/cmd/ssh_sftp_windows.go b/client/cmd/ssh_sftp_windows.go
 deleted file mode 100644
-index ffd2d11..0000000
+index ffd2d1148..000000000
 --- a/client/cmd/ssh_sftp_windows.go
 +++ /dev/null
 @@ -1,94 +0,0 @@
@@ -3822,9 +4930,732 @@ index ffd2d11..0000000
 -	os.Exit(exitCode)
 -	return nil
 -}
+diff --git a/client/cmd/ssh_test.go b/client/cmd/ssh_test.go
+deleted file mode 100644
+index 16ffadb90..000000000
+--- a/client/cmd/ssh_test.go
++++ /dev/null
+@@ -1,717 +0,0 @@
+-package cmd
+-
+-import (
+-	"testing"
+-
+-	"github.com/stretchr/testify/assert"
+-	"github.com/stretchr/testify/require"
+-)
+-
+-func TestSSHCommand_FlagParsing(t *testing.T) {
+-	tests := []struct {
+-		name         string
+-		args         []string
+-		expectedHost string
+-		expectedUser string
+-		expectedPort int
+-		expectedCmd  string
+-		expectError  bool
+-	}{
+-		{
+-			name:         "basic host",
+-			args:         []string{"hostname"},
+-			expectedHost: "hostname",
+-			expectedUser: "",
+-			expectedPort: 22,
+-			expectedCmd:  "",
+-		},
+-		{
+-			name:         "user@host format",
+-			args:         []string{"user@hostname"},
+-			expectedHost: "hostname",
+-			expectedUser: "user",
+-			expectedPort: 22,
+-			expectedCmd:  "",
+-		},
+-		{
+-			name:         "host with command",
+-			args:         []string{"hostname", "echo", "hello"},
+-			expectedHost: "hostname",
+-			expectedUser: "",
+-			expectedPort: 22,
+-			expectedCmd:  "echo hello",
+-		},
+-		{
+-			name:         "command with flags should be preserved",
+-			args:         []string{"hostname", "ls", "-la", "/tmp"},
+-			expectedHost: "hostname",
+-			expectedUser: "",
+-			expectedPort: 22,
+-			expectedCmd:  "ls -la /tmp",
+-		},
+-		{
+-			name:         "double dash separator",
+-			args:         []string{"hostname", "--", "ls", "-la"},
+-			expectedHost: "hostname",
+-			expectedUser: "",
+-			expectedPort: 22,
+-			expectedCmd:  "-- ls -la",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			// Reset global variables
+-			host = ""
+-			username = ""
+-			port = 22
+-			command = ""
+-
+-			// Mock command for testing
+-			cmd := sshCmd
+-			cmd.SetArgs(tt.args)
+-
+-			err := validateSSHArgsWithoutFlagParsing(cmd, tt.args)
+-
+-			if tt.expectError {
+-				assert.Error(t, err)
+-				return
+-			}
+-
+-			require.NoError(t, err, "SSH args validation should succeed for valid input")
+-			assert.Equal(t, tt.expectedHost, host, "host mismatch")
+-			if tt.expectedUser != "" {
+-				assert.Equal(t, tt.expectedUser, username, "username mismatch")
+-			}
+-			assert.Equal(t, tt.expectedPort, port, "port mismatch")
+-			assert.Equal(t, tt.expectedCmd, command, "command mismatch")
+-		})
+-	}
+-}
+-
+-func TestSSHCommand_FlagConflictPrevention(t *testing.T) {
+-	// Test that SSH flags don't conflict with command flags
+-	tests := []struct {
+-		name        string
+-		args        []string
+-		expectedCmd string
+-		description string
+-	}{
+-		{
+-			name:        "ls with -la flags",
+-			args:        []string{"hostname", "ls", "-la"},
+-			expectedCmd: "ls -la",
+-			description: "ls flags should be passed to remote command",
+-		},
+-		{
+-			name:        "grep with -r flag",
+-			args:        []string{"hostname", "grep", "-r", "pattern", "/path"},
+-			expectedCmd: "grep -r pattern /path",
+-			description: "grep flags should be passed to remote command",
+-		},
+-		{
+-			name:        "ps with aux flags",
+-			args:        []string{"hostname", "ps", "aux"},
+-			expectedCmd: "ps aux",
+-			description: "ps flags should be passed to remote command",
+-		},
+-		{
+-			name:        "command with double dash",
+-			args:        []string{"hostname", "--", "ls", "-la"},
+-			expectedCmd: "-- ls -la",
+-			description: "double dash should be preserved in command",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			// Reset global variables
+-			host = ""
+-			username = ""
+-			port = 22
+-			command = ""
+-
+-			cmd := sshCmd
+-			err := validateSSHArgsWithoutFlagParsing(cmd, tt.args)
+-			require.NoError(t, err, "SSH args validation should succeed for valid input")
+-
+-			assert.Equal(t, tt.expectedCmd, command, tt.description)
+-		})
+-	}
+-}
+-
+-func TestSSHCommand_NonInteractiveExecution(t *testing.T) {
+-	// Test that commands with arguments should execute the command and exit,
+-	// not drop to an interactive shell
+-	tests := []struct {
+-		name        string
+-		args        []string
+-		expectedCmd string
+-		shouldExit  bool
+-		description string
+-	}{
+-		{
+-			name:        "ls command should execute and exit",
+-			args:        []string{"hostname", "ls"},
+-			expectedCmd: "ls",
+-			shouldExit:  true,
+-			description: "ls command should execute and exit, not drop to shell",
+-		},
+-		{
+-			name:        "ls with flags should execute and exit",
+-			args:        []string{"hostname", "ls", "-la"},
+-			expectedCmd: "ls -la",
+-			shouldExit:  true,
+-			description: "ls with flags should execute and exit, not drop to shell",
+-		},
+-		{
+-			name:        "pwd command should execute and exit",
+-			args:        []string{"hostname", "pwd"},
+-			expectedCmd: "pwd",
+-			shouldExit:  true,
+-			description: "pwd command should execute and exit, not drop to shell",
+-		},
+-		{
+-			name:        "echo command should execute and exit",
+-			args:        []string{"hostname", "echo", "hello"},
+-			expectedCmd: "echo hello",
+-			shouldExit:  true,
+-			description: "echo command should execute and exit, not drop to shell",
+-		},
+-		{
+-			name:        "no command should open shell",
+-			args:        []string{"hostname"},
+-			expectedCmd: "",
+-			shouldExit:  false,
+-			description: "no command should open interactive shell",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			// Reset global variables
+-			host = ""
+-			username = ""
+-			port = 22
+-			command = ""
+-
+-			cmd := sshCmd
+-			err := validateSSHArgsWithoutFlagParsing(cmd, tt.args)
+-			require.NoError(t, err, "SSH args validation should succeed for valid input")
+-
+-			assert.Equal(t, tt.expectedCmd, command, tt.description)
+-
+-			// When command is present, it should execute the command and exit
+-			// When command is empty, it should open interactive shell
+-			hasCommand := command != ""
+-			assert.Equal(t, tt.shouldExit, hasCommand, "Command presence should match expected behavior")
+-		})
+-	}
+-}
+-
+-func TestSSHCommand_FlagHandling(t *testing.T) {
+-	// Test that flags after hostname are not parsed by netbird but passed to SSH command
+-	tests := []struct {
+-		name         string
+-		args         []string
+-		expectedHost string
+-		expectedCmd  string
+-		expectError  bool
+-		description  string
+-	}{
+-		{
+-			name:         "ls with -la flag should not be parsed by netbird",
+-			args:         []string{"debian2", "ls", "-la"},
+-			expectedHost: "debian2",
+-			expectedCmd:  "ls -la",
+-			expectError:  false,
+-			description:  "ls -la should be passed as SSH command, not parsed as netbird flags",
+-		},
+-		{
+-			name:         "command with netbird-like flags should be passed through",
+-			args:         []string{"hostname", "echo", "--help"},
+-			expectedHost: "hostname",
+-			expectedCmd:  "echo --help",
+-			expectError:  false,
+-			description:  "--help should be passed to echo, not parsed by netbird",
+-		},
+-		{
+-			name:         "command with -p flag should not conflict with SSH port flag",
+-			args:         []string{"hostname", "ps", "-p", "1234"},
+-			expectedHost: "hostname",
+-			expectedCmd:  "ps -p 1234",
+-			expectError:  false,
+-			description:  "ps -p should be passed to ps command, not parsed as port",
+-		},
+-		{
+-			name:         "tar with flags should be passed through",
+-			args:         []string{"hostname", "tar", "-czf", "backup.tar.gz", "/home"},
+-			expectedHost: "hostname",
+-			expectedCmd:  "tar -czf backup.tar.gz /home",
+-			expectError:  false,
+-			description:  "tar flags should be passed to tar command",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			// Reset global variables
+-			host = ""
+-			username = ""
+-			port = 22
+-			command = ""
+-
+-			cmd := sshCmd
+-			err := validateSSHArgsWithoutFlagParsing(cmd, tt.args)
+-
+-			if tt.expectError {
+-				assert.Error(t, err)
+-				return
+-			}
+-
+-			require.NoError(t, err, "SSH args validation should succeed for valid input")
+-			assert.Equal(t, tt.expectedHost, host, "host mismatch")
+-			assert.Equal(t, tt.expectedCmd, command, tt.description)
+-		})
+-	}
+-}
+-
+-func TestSSHCommand_RegressionFlagParsing(t *testing.T) {
+-	// Regression test for the specific issue: "sudo ./netbird ssh debian2 ls -la"
+-	// should not parse -la as netbird flags but pass them to the SSH command
+-	tests := []struct {
+-		name         string
+-		args         []string
+-		expectedHost string
+-		expectedCmd  string
+-		expectError  bool
+-		description  string
+-	}{
+-		{
+-			name:         "original issue: ls -la should be preserved",
+-			args:         []string{"debian2", "ls", "-la"},
+-			expectedHost: "debian2",
+-			expectedCmd:  "ls -la",
+-			expectError:  false,
+-			description:  "The original failing case should now work",
+-		},
+-		{
+-			name:         "ls -l should be preserved",
+-			args:         []string{"hostname", "ls", "-l"},
+-			expectedHost: "hostname",
+-			expectedCmd:  "ls -l",
+-			expectError:  false,
+-			description:  "Single letter flags should be preserved",
+-		},
+-		{
+-			name:         "SSH port flag should work",
+-			args:         []string{"-p", "2222", "hostname", "ls", "-la"},
+-			expectedHost: "hostname",
+-			expectedCmd:  "ls -la",
+-			expectError:  false,
+-			description:  "SSH -p flag should be parsed, command flags preserved",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			// Reset global variables
+-			host = ""
+-			username = ""
+-			port = 22
+-			command = ""
+-
+-			cmd := sshCmd
+-			err := validateSSHArgsWithoutFlagParsing(cmd, tt.args)
+-
+-			if tt.expectError {
+-				assert.Error(t, err)
+-				return
+-			}
+-
+-			require.NoError(t, err, "SSH args validation should succeed for valid input")
+-			assert.Equal(t, tt.expectedHost, host, "host mismatch")
+-			assert.Equal(t, tt.expectedCmd, command, tt.description)
+-
+-			// Check port for the test case with -p flag
+-			if len(tt.args) > 0 && tt.args[0] == "-p" {
+-				assert.Equal(t, 2222, port, "port should be parsed from -p flag")
+-			}
+-		})
+-	}
+-}
+-
+-func TestSSHCommand_PortForwardingFlagParsing(t *testing.T) {
+-	tests := []struct {
+-		name           string
+-		args           []string
+-		expectedHost   string
+-		expectedLocal  []string
+-		expectedRemote []string
+-		expectError    bool
+-		description    string
+-	}{
+-		{
+-			name:           "local port forwarding -L",
+-			args:           []string{"-L", "8080:localhost:80", "hostname"},
+-			expectedHost:   "hostname",
+-			expectedLocal:  []string{"8080:localhost:80"},
+-			expectedRemote: []string{},
+-			expectError:    false,
+-			description:    "Single -L flag should be parsed correctly",
+-		},
+-		{
+-			name:           "remote port forwarding -R",
+-			args:           []string{"-R", "8080:localhost:80", "hostname"},
+-			expectedHost:   "hostname",
+-			expectedLocal:  []string{},
+-			expectedRemote: []string{"8080:localhost:80"},
+-			expectError:    false,
+-			description:    "Single -R flag should be parsed correctly",
+-		},
+-		{
+-			name:           "multiple local port forwards",
+-			args:           []string{"-L", "8080:localhost:80", "-L", "9090:localhost:443", "hostname"},
+-			expectedHost:   "hostname",
+-			expectedLocal:  []string{"8080:localhost:80", "9090:localhost:443"},
+-			expectedRemote: []string{},
+-			expectError:    false,
+-			description:    "Multiple -L flags should be parsed correctly",
+-		},
+-		{
+-			name:           "multiple remote port forwards",
+-			args:           []string{"-R", "8080:localhost:80", "-R", "9090:localhost:443", "hostname"},
+-			expectedHost:   "hostname",
+-			expectedLocal:  []string{},
+-			expectedRemote: []string{"8080:localhost:80", "9090:localhost:443"},
+-			expectError:    false,
+-			description:    "Multiple -R flags should be parsed correctly",
+-		},
+-		{
+-			name:           "mixed local and remote forwards",
+-			args:           []string{"-L", "8080:localhost:80", "-R", "9090:localhost:443", "hostname"},
+-			expectedHost:   "hostname",
+-			expectedLocal:  []string{"8080:localhost:80"},
+-			expectedRemote: []string{"9090:localhost:443"},
+-			expectError:    false,
+-			description:    "Mixed -L and -R flags should be parsed correctly",
+-		},
+-		{
+-			name:           "port forwarding with bind address",
+-			args:           []string{"-L", "127.0.0.1:8080:localhost:80", "hostname"},
+-			expectedHost:   "hostname",
+-			expectedLocal:  []string{"127.0.0.1:8080:localhost:80"},
+-			expectedRemote: []string{},
+-			expectError:    false,
+-			description:    "Port forwarding with bind address should work",
+-		},
+-		{
+-			name:           "port forwarding with command",
+-			args:           []string{"-L", "8080:localhost:80", "hostname", "ls", "-la"},
+-			expectedHost:   "hostname",
+-			expectedLocal:  []string{"8080:localhost:80"},
+-			expectedRemote: []string{},
+-			expectError:    false,
+-			description:    "Port forwarding with command should work",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			// Reset global variables
+-			host = ""
+-			username = ""
+-			port = 22
+-			command = ""
+-			localForwards = nil
+-			remoteForwards = nil
+-
+-			cmd := sshCmd
+-			err := validateSSHArgsWithoutFlagParsing(cmd, tt.args)
+-
+-			if tt.expectError {
+-				assert.Error(t, err)
+-				return
+-			}
+-
+-			require.NoError(t, err, "SSH args validation should succeed for valid input")
+-			assert.Equal(t, tt.expectedHost, host, "host mismatch")
+-			// Handle nil vs empty slice comparison
+-			if len(tt.expectedLocal) == 0 {
+-				assert.True(t, len(localForwards) == 0, tt.description+" - local forwards should be empty")
+-			} else {
+-				assert.Equal(t, tt.expectedLocal, localForwards, tt.description+" - local forwards")
+-			}
+-			if len(tt.expectedRemote) == 0 {
+-				assert.True(t, len(remoteForwards) == 0, tt.description+" - remote forwards should be empty")
+-			} else {
+-				assert.Equal(t, tt.expectedRemote, remoteForwards, tt.description+" - remote forwards")
+-			}
+-		})
+-	}
+-}
+-
+-func TestParsePortForward(t *testing.T) {
+-	tests := []struct {
+-		name           string
+-		spec           string
+-		expectedLocal  string
+-		expectedRemote string
+-		expectError    bool
+-		description    string
+-	}{
+-		{
+-			name:           "simple port forward",
+-			spec:           "8080:localhost:80",
+-			expectedLocal:  "localhost:8080",
+-			expectedRemote: "localhost:80",
+-			expectError:    false,
+-			description:    "Simple port:host:port format should work",
+-		},
+-		{
+-			name:           "port forward with bind address",
+-			spec:           "127.0.0.1:8080:localhost:80",
+-			expectedLocal:  "127.0.0.1:8080",
+-			expectedRemote: "localhost:80",
+-			expectError:    false,
+-			description:    "bind_address:port:host:port format should work",
+-		},
+-		{
+-			name:           "port forward to different host",
+-			spec:           "8080:example.com:443",
+-			expectedLocal:  "localhost:8080",
+-			expectedRemote: "example.com:443",
+-			expectError:    false,
+-			description:    "Forwarding to different host should work",
+-		},
+-		{
+-			name:        "port forward with IPv6 (needs bracket support)",
+-			spec:        "::1:8080:localhost:80",
+-			expectError: true,
+-			description: "IPv6 without brackets fails as expected (feature to implement)",
+-		},
+-		{
+-			name:        "invalid format - too few parts",
+-			spec:        "8080:localhost",
+-			expectError: true,
+-			description: "Invalid format with too few parts should fail",
+-		},
+-		{
+-			name:        "invalid format - too many parts",
+-			spec:        "127.0.0.1:8080:localhost:80:extra",
+-			expectError: true,
+-			description: "Invalid format with too many parts should fail",
+-		},
+-		{
+-			name:        "empty spec",
+-			spec:        "",
+-			expectError: true,
+-			description: "Empty spec should fail",
+-		},
+-		{
+-			name:           "unix socket local forward",
+-			spec:           "8080:/tmp/socket",
+-			expectedLocal:  "localhost:8080",
+-			expectedRemote: "/tmp/socket",
+-			expectError:    false,
+-			description:    "Unix socket forwarding should work",
+-		},
+-		{
+-			name:           "unix socket with bind address",
+-			spec:           "127.0.0.1:8080:/tmp/socket",
+-			expectedLocal:  "127.0.0.1:8080",
+-			expectedRemote: "/tmp/socket",
+-			expectError:    false,
+-			description:    "Unix socket with bind address should work",
+-		},
+-		{
+-			name:           "wildcard bind all interfaces",
+-			spec:           "*:8080:localhost:80",
+-			expectedLocal:  ":8080",
+-			expectedRemote: "localhost:80",
+-			expectError:    false,
+-			description:    "Wildcard * should bind to all interfaces (dual-stack)",
+-		},
+-		{
+-			name:           "wildcard for port only",
+-			spec:           "8080:*:80",
+-			expectedLocal:  "localhost:8080",
+-			expectedRemote: "*:80",
+-			expectError:    false,
+-			description:    "Wildcard in remote host should be preserved",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			localAddr, remoteAddr, err := parsePortForwardSpec(tt.spec)
+-
+-			if tt.expectError {
+-				assert.Error(t, err, tt.description)
+-				return
+-			}
+-
+-			require.NoError(t, err, tt.description)
+-			assert.Equal(t, tt.expectedLocal, localAddr, tt.description+" - local address")
+-			assert.Equal(t, tt.expectedRemote, remoteAddr, tt.description+" - remote address")
+-		})
+-	}
+-}
+-
+-func TestSSHCommand_IntegrationPortForwarding(t *testing.T) {
+-	// Integration test for port forwarding with the actual SSH command implementation
+-	tests := []struct {
+-		name           string
+-		args           []string
+-		expectedHost   string
+-		expectedLocal  []string
+-		expectedRemote []string
+-		expectedCmd    string
+-		description    string
+-	}{
+-		{
+-			name:           "local forward with command",
+-			args:           []string{"-L", "8080:localhost:80", "hostname", "echo", "test"},
+-			expectedHost:   "hostname",
+-			expectedLocal:  []string{"8080:localhost:80"},
+-			expectedRemote: []string{},
+-			expectedCmd:    "echo test",
+-			description:    "Local forwarding should work with commands",
+-		},
+-		{
+-			name:           "remote forward with command",
+-			args:           []string{"-R", "8080:localhost:80", "hostname", "ls", "-la"},
+-			expectedHost:   "hostname",
+-			expectedLocal:  []string{},
+-			expectedRemote: []string{"8080:localhost:80"},
+-			expectedCmd:    "ls -la",
+-			description:    "Remote forwarding should work with commands",
+-		},
+-		{
+-			name:           "multiple forwards with user and command",
+-			args:           []string{"-L", "8080:localhost:80", "-R", "9090:localhost:443", "user@hostname", "ps", "aux"},
+-			expectedHost:   "hostname",
+-			expectedLocal:  []string{"8080:localhost:80"},
+-			expectedRemote: []string{"9090:localhost:443"},
+-			expectedCmd:    "ps aux",
+-			description:    "Complex case with multiple forwards, user, and command",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			// Reset global variables
+-			host = ""
+-			username = ""
+-			port = 22
+-			command = ""
+-			localForwards = nil
+-			remoteForwards = nil
+-
+-			cmd := sshCmd
+-			err := validateSSHArgsWithoutFlagParsing(cmd, tt.args)
+-			require.NoError(t, err, "SSH args validation should succeed for valid input")
+-
+-			assert.Equal(t, tt.expectedHost, host, "host mismatch")
+-			// Handle nil vs empty slice comparison
+-			if len(tt.expectedLocal) == 0 {
+-				assert.True(t, len(localForwards) == 0, tt.description+" - local forwards should be empty")
+-			} else {
+-				assert.Equal(t, tt.expectedLocal, localForwards, tt.description+" - local forwards")
+-			}
+-			if len(tt.expectedRemote) == 0 {
+-				assert.True(t, len(remoteForwards) == 0, tt.description+" - remote forwards should be empty")
+-			} else {
+-				assert.Equal(t, tt.expectedRemote, remoteForwards, tt.description+" - remote forwards")
+-			}
+-			assert.Equal(t, tt.expectedCmd, command, tt.description+" - command")
+-		})
+-	}
+-}
+-
+-func TestSSHCommand_ParameterIsolation(t *testing.T) {
+-	tests := []struct {
+-		name        string
+-		args        []string
+-		expectedCmd string
+-	}{
+-		{
+-			name:        "cmd flag passed as command",
+-			args:        []string{"hostname", "--cmd", "echo test"},
+-			expectedCmd: "--cmd echo test",
+-		},
+-		{
+-			name:        "uid flag passed as command",
+-			args:        []string{"hostname", "--uid", "1000"},
+-			expectedCmd: "--uid 1000",
+-		},
+-		{
+-			name:        "shell flag passed as command",
+-			args:        []string{"hostname", "--shell", "/bin/bash"},
+-			expectedCmd: "--shell /bin/bash",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			host = ""
+-			username = ""
+-			port = 22
+-			command = ""
+-
+-			err := validateSSHArgsWithoutFlagParsing(sshCmd, tt.args)
+-			require.NoError(t, err)
+-
+-			assert.Equal(t, "hostname", host)
+-			assert.Equal(t, tt.expectedCmd, command)
+-		})
+-	}
+-}
+-
+-func TestSSHCommand_InvalidFlagRejection(t *testing.T) {
+-	// Test that invalid flags are properly rejected and not misinterpreted as hostnames
+-	tests := []struct {
+-		name        string
+-		args        []string
+-		description string
+-	}{
+-		{
+-			name:        "invalid long flag before hostname",
+-			args:        []string{"--invalid-flag", "hostname"},
+-			description: "Invalid flag should return parse error, not treat flag as hostname",
+-		},
+-		{
+-			name:        "invalid short flag before hostname",
+-			args:        []string{"-x", "hostname"},
+-			description: "Invalid short flag should return parse error",
+-		},
+-		{
+-			name:        "invalid flag with value before hostname",
+-			args:        []string{"--invalid-option=value", "hostname"},
+-			description: "Invalid flag with value should return parse error",
+-		},
+-		{
+-			name:        "typo in known flag",
+-			args:        []string{"--por", "2222", "hostname"},
+-			description: "Typo in flag name should return parse error (not silently ignored)",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			// Reset global variables
+-			host = ""
+-			username = ""
+-			port = 22
+-			command = ""
+-
+-			err := validateSSHArgsWithoutFlagParsing(sshCmd, tt.args)
+-
+-			// Should return an error for invalid flags
+-			assert.Error(t, err, tt.description)
+-
+-			// Should not have set host to the invalid flag
+-			assert.NotEqual(t, tt.args[0], host, "Invalid flag should not be interpreted as hostname")
+-		})
+-	}
+-}
 diff --git a/client/cmd/state.go b/client/cmd/state.go
 deleted file mode 100644
-index b4612e6..0000000
+index b4612e601..000000000
 --- a/client/cmd/state.go
 +++ /dev/null
 @@ -1,181 +0,0 @@
@@ -4011,7 +5842,7 @@ index b4612e6..0000000
 -}
 diff --git a/client/cmd/trace.go b/client/cmd/trace.go
 deleted file mode 100644
-index 6558382..0000000
+index 655838260..000000000
 --- a/client/cmd/trace.go
 +++ /dev/null
 @@ -1,137 +0,0 @@
@@ -4153,7 +5984,7 @@ index 6558382..0000000
 -	cmd.Printf("\nFinal disposition: %s\n", disposition)
 -}
 diff --git a/client/cmd/up.go b/client/cmd/up.go
-index f5fac97..2290f7f 100644
+index 120a25595..f010de624 100644
 --- a/client/cmd/up.go
 +++ b/client/cmd/up.go
 @@ -273,7 +273,6 @@ func runInForegroundMode(ctx context.Context, cmd *cobra.Command, activeProf *pr
@@ -4164,19 +5995,40 @@ index f5fac97..2290f7f 100644
  
  	return connectClient.Run(nil, util.FindFirstLogPath(logFiles))
  }
-@@ -958,3 +957,15 @@ func daemonActiveProfileForUser(ctx context.Context, client proto.DaemonServiceC
- 	}
- 	return &profilemanager.Profile{ID: profilemanager.ID(active.GetId())}, nil
+@@ -453,28 +452,14 @@ func setBoolPtrIfChanged(cmd *cobra.Command, name string, dst **bool, val bool)
+ // passed into req, leaving the rest unset so the daemon keeps the
+ // persisted values.
+ func setSSHSetConfigFields(req *proto.SetConfigRequest, cmd *cobra.Command) {
+-	if cmd.Flag(serverSSHAllowedFlag).Changed {
+-		req.ServerSSHAllowed = &serverSSHAllowed
+-	}
+-	if cmd.Flag(enableSSHRootFlag).Changed {
+-		req.EnableSSHRoot = &enableSSHRoot
+-	}
+-	if cmd.Flag(enableSSHSFTPFlag).Changed {
+-		req.EnableSSHSFTP = &enableSSHSFTP
+-	}
+-	if cmd.Flag(enableSSHLocalPortForwardFlag).Changed {
+-		req.EnableSSHLocalPortForwarding = &enableSSHLocalPortForward
+-	}
+-	if cmd.Flag(enableSSHRemotePortForwardFlag).Changed {
+-		req.EnableSSHRemotePortForwarding = &enableSSHRemotePortForward
+-	}
+-	if cmd.Flag(disableSSHAuthFlag).Changed {
+-		req.DisableSSHAuth = &disableSSHAuth
+-	}
+-	if cmd.Flag(sshJWTCacheTTLFlag).Changed {
+-		sshJWTCacheTTL32 := int32(sshJWTCacheTTL)
+-		req.SshJWTCacheTTL = &sshJWTCacheTTL32
+-	}
++	// IP-KVM：SSH 服务端相关的 flag（serverSSHAllowed / enableSSHRoot /
++	// enableSSHSFTP / SSHLocalPortForward / SSHRemotePortForward /
++	// disableSSHAuth / sshJWTCacheTTL）全部定义在 ssh.go，而 ssh.go 已在
++	// 裁剪中删除（它连带 client/ssh 网关与 profilemanager 的 SSH 状态）。
++	// 因此这里不再拷贝这些字段：保持 req 里对应字段为 nil，daemon 沿用
++	// 已持久化的值——与"用户没传这些 flag"时的行为一致。
++	_ = req
++	_ = cmd
  }
-+
-+func addProfileOnDaemon(ctx context.Context, client proto.DaemonServiceClient, profileName, username string) (profilemanager.ID, error) {
-+	resp, err := client.AddProfile(ctx, &proto.AddProfileRequest{
-+		ProfileName: profileName,
-+		Username:    username,
-+	})
-+	if err != nil {
-+		return "", fmt.Errorf("add profile failed: %w", err)
-+	}
-+
-+	return profilemanager.ID(resp.Id), nil
-+}
+ 
+ // refusedSettingsUpdate reports whether err is the daemon refusing the settings
