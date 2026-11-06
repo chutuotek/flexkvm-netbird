@@ -37,14 +37,23 @@
 
 #define PROG "netbird-cli"
 
-/* JSON socket 路径：编译期可覆盖（设备上是 /userdata/nb/nb-http.sock） */
+/*
+ * 控制面 socket 路径。**必须与 flexkvm-app 的 netbird 模块一致**
+ * （见 project/app/flexkvm-app/src/module/app/netbird/netbird.h 的
+ * NETBIRD_RUN_DIR = FLEXKVM_DATA_PATH("netbird")）：
+ *   /userdata/netbird/nb-http.sock   HTTP/JSON（grpc-gateway）
+ *   /userdata/netbird/nb.sock        gRPC（官方 CLI 用）
+ *
+ * 早先这里写的是 /userdata/nb/，与模块的实际运行目录不一致，导致
+ * "daemon 明明在跑，CLI 却报 not running"。编译期仍可 -D 覆盖（宿主测试用）。
+ */
 #ifndef NB_HTTP_SOCK
-#define NB_HTTP_SOCK "/userdata/nb/nb-http.sock"
+#define NB_HTTP_SOCK "/userdata/netbird/nb-http.sock"
 #endif
 
 /* gRPC 控制 socket：权限同样是 0666，加固时一起收 */
 #ifndef NB_DAEMON_SOCK
-#define NB_DAEMON_SOCK "/userdata/nb/nb.sock"
+#define NB_DAEMON_SOCK "/userdata/netbird/nb.sock"
 #endif
 
 /*
